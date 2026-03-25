@@ -11,7 +11,6 @@ import (
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/plugin"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/requestcontrol"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/scheduling"
-	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/plugins/scheduling/scorer/prefix"
 )
 
 const (
@@ -35,10 +34,10 @@ var _ requestcontrol.PreRequest = &NoHitLRU{}
 // NoHitLRUParameters defines the parameters for the NoHitLRU scorer.
 type NoHitLRUParameters struct {
 	// PrefixPluginType defines the type of the prefix cache plugin to read state from.
-	// Defaults to "prefix-cache-scorer".
+	// Defaults to "precise-prefix-cache-scorer".
 	PrefixPluginType string `json:"prefixPluginType"`
 	// PrefixPluginName defines the name of the prefix cache plugin to read state from.
-	// Defaults to "prefix-cache-scorer".
+	// Defaults to "precise-prefix-cache-scorer".
 	PrefixPluginName string `json:"prefixPluginName"`
 
 	// LRUSize defines the maximum number of endpoints to track in the LRU cache.
@@ -66,7 +65,7 @@ func NoHitLRUFactory(name string, rawParameters json.RawMessage, handle plugin.H
 	}
 
 	if parameters.PrefixPluginName == "" {
-		parameters.PrefixPluginName = prefix.PrefixCachePluginType
+		parameters.PrefixPluginName = PrecisePrefixCachePluginType
 	}
 
 	// Note: We don't enforce that the prefix plugin exists here
@@ -77,8 +76,8 @@ func NoHitLRUFactory(name string, rawParameters json.RawMessage, handle plugin.H
 
 // NewNoHitLRU creates a new NoHitLRU scorer
 func NewNoHitLRU(ctx context.Context, params *NoHitLRUParameters) *NoHitLRU {
-	prefixPluginType := prefix.PrefixCachePluginType
-	prefixPluginName := prefix.PrefixCachePluginType
+	prefixPluginType := PrecisePrefixCachePluginType
+	prefixPluginName := PrecisePrefixCachePluginType
 	lruSize := defaultLRUSize
 
 	if params != nil {
@@ -138,17 +137,15 @@ func (s *NoHitLRU) Category() scheduling.ScorerCategory {
 func (s *NoHitLRU) isColdRequest(ctx context.Context, cycleState *scheduling.CycleState) bool {
 	logger := log.FromContext(ctx).V(logutil.DEBUG)
 
-	// Read prefix cache state to determine if this is a cold request
-	// This is treated as an optimization - if the state isn't available, we assume cold request
-	prefixState, err := scheduling.ReadCycleStateKey[*prefix.SchedulingContextState](cycleState, plugin.StateKey(s.prefixPluginTypedName.String()))
-
+	// Read the PrefixCacheHitState written by PrecisePrefixCacheScorer.
+	// This is treated as an optimization - if the state isn't available, we assume cold request.
+	hitState, err := scheduling.ReadCycleStateKey[*PrefixCacheHitState](cycleState, plugin.StateKey(s.prefixPluginTypedName.String()))
 	if err != nil {
-		logger.Info("No prefix cache state found, treating as cold request for LRU optimization", "error", err)
+		logger.Info("No prefix cache hit state found, treating as cold request for LRU optimization", "error", err)
 		return true
 	}
 
-	// Check if this is a cold request (no prefix cache hits)
-	return len(prefixState.PrefixCacheServers) == 0
+	return !hitState.HasCacheHit
 }
 
 // scoreNeutral returns neutral scores (0.5) for all endpoints.

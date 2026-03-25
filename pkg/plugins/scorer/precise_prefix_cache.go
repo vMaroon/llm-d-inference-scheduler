@@ -19,9 +19,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	logutil "sigs.k8s.io/gateway-api-inference-extension/pkg/common/observability/logging"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/plugin"
+	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/requestcontrol"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/scheduling"
-	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/plugins/scheduling/scorer/prefix"
 
+	"github.com/llm-d/llm-d-inference-scheduler/pkg/plugins/preparedata"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/telemetry"
 )
 
@@ -51,8 +52,9 @@ type PrecisePrefixCachePluginConfig struct {
 	KVEventsConfig *kvevents.Config `json:"kvEventsConfig"`
 }
 
-// compile-time type assertion
+// compile-time type assertions
 var _ scheduling.Scorer = &PrecisePrefixCacheScorer{}
+var _ requestcontrol.PrepareDataPlugin = &PrecisePrefixCacheScorer{}
 
 // PrecisePrefixCachePluginFactory defines the factory function for creating
 // a new instance of the PrefixCacheTrackingPlugin.
@@ -149,20 +151,31 @@ func New(ctx context.Context, config PrecisePrefixCachePluginConfig) (*PrecisePr
 	return &PrecisePrefixCacheScorer{
 		typedName:          plugin.TypedName{Type: PrecisePrefixCachePluginType},
 		kvCacheIndexer:     kvCacheIndexer,
+		tokenProcessor:     tokenProcessor,
 		subscribersCache:   subscribersCache,
 		subscribersManager: subscribersManager,
 		kvEventsConfig:     config.KVEventsConfig,
 	}, nil
 }
 
-// PrecisePrefixCacheScorer implements the framework.Scorer interface.
-// The scorer implements precise prefix-cache KV-block locality scoring.
+// PrecisePrefixCacheScorer implements the framework.Scorer and
+// requestcontrol.PrepareDataPlugin interfaces.
+// It implements precise prefix-cache KV-block locality scoring.
 // It uses the `kvcache.Indexer` to score endpoints based on the KV-cache index
 // state, and the `kvevents.Pool` to subscribe to KV-cache events
 // to keep the internal KV-cache index state up-to-date.
+//
+// When the tokenizer PrepareData plugin runs before this plugin,
+// pre-tokenized data from request.TokenizedPrompt is used directly,
+// avoiding redundant tokenization.
+// When the tokenizer plugin is not configured, the scorer falls back
+// to internal tokenization via the kvcache.Indexer.
 type PrecisePrefixCacheScorer struct {
 	typedName      plugin.TypedName
 	kvCacheIndexer kvCacheIndexer
+	// tokenProcessor converts token IDs to KV-block keys. Used to compute
+	// block keys from pre-tokenized data provided by the tokenizer plugin.
+	tokenProcessor kvblock.TokenProcessor
 
 	// until the IGW data-layer is ready to provide endpoint events,
 	// we maintain a TTL cache of known endpoints that are discovered through
@@ -188,6 +201,27 @@ func (s *PrecisePrefixCacheScorer) WithName(name string) *PrecisePrefixCacheScor
 // Category returns the preference the scorer applies when scoring candidate endpoints.
 func (s *PrecisePrefixCacheScorer) Category() scheduling.ScorerCategory {
 	return scheduling.Affinity
+}
+
+// Produces returns the data keys this plugin produces.
+func (s *PrecisePrefixCacheScorer) Produces() map[string]any {
+	return nil
+}
+
+// Consumes declares an optional dependency on pre-tokenized data from
+// the tokenizer PrepareData plugin. When the tokenizer plugin is configured
+// and runs first, this scorer uses the pre-computed tokens directly;
+// otherwise it falls back to internal tokenization.
+func (s *PrecisePrefixCacheScorer) Consumes() map[string]any {
+	return map[string]any{
+		preparedata.TokenizedPromptKey: (*scheduling.TokenizedPrompt)(nil),
+	}
+}
+
+// PrepareRequestData is a no-op. The scorer consumes TokenizedPrompt produced
+// by the tokenizer plugin but does not itself produce any PrepareData output.
+func (s *PrecisePrefixCacheScorer) PrepareRequestData(_ context.Context, _ *scheduling.LLMRequest, _ []scheduling.Endpoint) error {
+	return nil
 }
 
 // Score scores the provided endpoint based on the KVCache index state.
@@ -266,19 +300,20 @@ func (s *PrecisePrefixCacheScorer) Score(ctx context.Context, cycleState *schedu
 		return metadata.Address, true
 	}
 
-	// Write prefix cache state to cycle state
-	state := &prefix.SchedulingContextState{
-		PrefixHashes:       []prefix.BlockHash{},
-		PrefixCacheServers: map[prefix.ServerID]int{},
-	}
-	for _, endpoint := range endpoints {
-		key, ok := endpointToKey(endpoint)
-		if !ok {
-			continue
+	// Compute the max raw score to determine if any endpoint had a cache hit.
+	maxRawScore := 0.0
+	for _, score := range scores {
+		if score > maxRawScore {
+			maxRawScore = score
 		}
-		state.PrefixCacheServers[prefix.ServerID(endpoint.GetMetadata().NamespacedName)] = int(scores[key])
 	}
-	cycleState.Write(plugin.StateKey(s.typedName.String()), state)
+
+	// Write PrefixCacheHitState so downstream plugins (e.g. NoHitLRU) can
+	// distinguish cold requests (no cache hits) from warm ones.
+	cycleState.Write(plugin.StateKey(s.typedName.String()), &PrefixCacheHitState{
+		HasCacheHit: maxRawScore > 0,
+		MaxRawScore: maxRawScore,
+	})
 
 	normalizedScores := indexedScoresToNormalizedScoredPods(endpoints, endpointToKey, scores)
 
@@ -304,12 +339,14 @@ func (s *PrecisePrefixCacheScorer) Score(ctx context.Context, cycleState *schedu
 	return normalizedScores
 }
 
-// getScores retrieves the endpoint scores from the KV-cache indexer
-// based on the provided LLM request.
-// If the request already has TokenizedPrompt set (e.g. by an external tokenizer
-// PrepareData plugin), it calls ScoreTokens directly, bypassing
-// prompt/chat tokenization.
-// Otherwise, chat completions and regular completions are tokenized internally.
+// getScores retrieves the endpoint scores from the KV-cache indexer.
+//
+// Scoring paths (in priority order):
+//  1. Pre-tokenized fast path: when request.TokenizedPrompt is set (by the
+//     tokenizer PrepareData plugin), tokens are scored directly with
+//     ScoreTokens. This avoids redundant tokenization.
+//  2. Internal tokenization fallback: when TokenizedPrompt is absent, the
+//     scorer delegates to GetPodScores which tokenizes internally.
 func (s *PrecisePrefixCacheScorer) getScores(ctx context.Context, request *scheduling.LLMRequest) (map[string]float64, error) {
 	logger := log.FromContext(ctx).WithName(s.typedName.String())
 	traceLogger := logger.V(logutil.TRACE)
@@ -318,8 +355,10 @@ func (s *PrecisePrefixCacheScorer) getScores(ctx context.Context, request *sched
 		"isChatCompletions", request.Body != nil && request.Body.ChatCompletions != nil,
 		"isCompletions", request.Body != nil && request.Body.Completions != nil)
 
+	// Fast path: use pre-tokenized data from the tokenizer plugin.
 	if request.TokenizedPrompt != nil && len(request.TokenizedPrompt.TokenIDs) > 0 {
-		traceLogger.Info("tokens already in the request, skipping tokenization")
+		traceLogger.Info("Using pre-tokenized data from tokenizer plugin",
+			"tokenCount", len(request.TokenizedPrompt.TokenIDs))
 
 		scores, err := s.kvCacheIndexer.ScoreTokens(ctx, request.TokenizedPrompt.TokenIDs, request.TargetModel, nil)
 		if err != nil {
@@ -328,6 +367,10 @@ func (s *PrecisePrefixCacheScorer) getScores(ctx context.Context, request *sched
 		return scores, nil
 	}
 
+	// Fallback: internal tokenization via the kvcache.Indexer.
+	// This path is used when the tokenizer PrepareData plugin is not configured.
+	logger.V(logutil.DEBUG).Info("TokenizedPrompt not available, falling back to internal tokenization")
+
 	// The upstream parser guarantees exactly one body is populated, but we defensively prioritize chat completions.
 	// If an unexpected dual payload slips through (parser regression/new client), log it and use chat semantics.
 	if request.Body != nil && request.Body.ChatCompletions != nil {
@@ -335,28 +378,10 @@ func (s *PrecisePrefixCacheScorer) getScores(ctx context.Context, request *sched
 			traceLogger.Info("Both chat/completions and completions present; defaulting to chat/completions")
 		}
 
-		// Convert messages to conversation format
-		conversations := make([]types.Conversation, len(request.Body.ChatCompletions.Messages))
-		for i, msg := range request.Body.ChatCompletions.Messages {
-			conversations[i] = types.Conversation{
-				Role:    msg.Role,
-				Content: msg.Content.Raw,
-			}
-		}
-
-		renderReq := &types.RenderChatRequest{
-			Conversation:              conversations,
-			Tools:                     request.Body.ChatCompletions.Tools,
-			Documents:                 request.Body.ChatCompletions.Documents,
-			ChatTemplate:              request.Body.ChatCompletions.ChatTemplate,
-			ReturnAssistantTokensMask: request.Body.ChatCompletions.ReturnAssistantTokensMask,
-			ContinueFinalMessage:      request.Body.ChatCompletions.ContinueFinalMessage,
-			AddGenerationPrompt:       request.Body.ChatCompletions.AddGenerationPrompt,
-			ChatTemplateKWArgs:        request.Body.ChatCompletions.ChatTemplateKWArgs,
-		}
+		renderReq := chatCompletionsToRenderChatRequest(request.Body.ChatCompletions)
 
 		traceLogger.Info("Processing chat completion request",
-			"messagesCount", len(conversations),
+			"messagesCount", len(renderReq.Conversation),
 			"toolsCount", len(renderReq.Tools),
 			"documentsCount", len(renderReq.Documents))
 
@@ -380,4 +405,27 @@ func (s *PrecisePrefixCacheScorer) getScores(ctx context.Context, request *sched
 	}
 
 	return nil, errors.New("no valid input found in request")
+}
+
+// chatCompletionsToRenderChatRequest converts a ChatCompletionsRequest to the
+// tokenization RenderChatRequest format used by the kvcache indexer.
+func chatCompletionsToRenderChatRequest(chat *scheduling.ChatCompletionsRequest) *types.RenderChatRequest {
+	conversations := make([]types.Conversation, len(chat.Messages))
+	for i, msg := range chat.Messages {
+		conversations[i] = types.Conversation{
+			Role:    msg.Role,
+			Content: msg.Content.Raw,
+		}
+	}
+
+	return &types.RenderChatRequest{
+		Conversation:              conversations,
+		Tools:                     chat.Tools,
+		Documents:                 chat.Documents,
+		ChatTemplate:              chat.ChatTemplate,
+		ReturnAssistantTokensMask: chat.ReturnAssistantTokensMask,
+		ContinueFinalMessage:      chat.ContinueFinalMessage,
+		AddGenerationPrompt:       chat.AddGenerationPrompt,
+		ChatTemplateKWArgs:        chat.ChatTemplateKWArgs,
+	}
 }
