@@ -135,3 +135,75 @@ func TestPrecisePrefixCacheScorer_SkipsTokenizedPromptWhenEmpty(t *testing.T) {
 	scorer.Score(ctx, scheduling.NewCycleState(), request, testEndpoints)
 	assert.False(t, fromTokensCalled, "ScoreTokens should not be called with empty TokenIDs")
 }
+
+func TestPrecisePrefixCacheScorer_WritesPrefixCacheHitState(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+
+	tests := []struct {
+		name        string
+		scores      map[string]float64
+		wantHasCacheHit bool
+		wantMaxRaw  float64
+	}{
+		{
+			name:        "cache hit",
+			scores:      map[string]float64{"10.0.0.1:8080": 3.0, "10.0.0.2:8080": 1.0},
+			wantHasCacheHit: true,
+			wantMaxRaw:  3.0,
+		},
+		{
+			name:        "cold request - no hits",
+			scores:      map[string]float64{},
+			wantHasCacheHit: false,
+			wantMaxRaw:  0.0,
+		},
+		{
+			name:        "all zero scores",
+			scores:      map[string]float64{"10.0.0.1:8080": 0.0, "10.0.0.2:8080": 0.0},
+			wantHasCacheHit: false,
+			wantMaxRaw:  0.0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scorer := &PrecisePrefixCacheScorer{
+				typedName:      plugin.TypedName{Type: PrecisePrefixCachePluginType, Name: PrecisePrefixCachePluginType},
+				kvEventsConfig: &kvevents.Config{},
+				kvCacheIndexer: &mockKVCacheIndexer{
+					scoreTokensFunc: func(_ context.Context, _ []uint32, _ string, _ []string) (map[string]float64, error) {
+						return tt.scores, nil
+					},
+				},
+			}
+
+			cycleState := scheduling.NewCycleState()
+			request := &scheduling.LLMRequest{
+				TargetModel: "test-model",
+				TokenizedPrompt: &scheduling.TokenizedPrompt{
+					TokenIDs: []uint32{10, 20, 30},
+				},
+			}
+
+			scorer.Score(ctx, cycleState, request, testEndpoints)
+
+			// Read the PrefixCacheHitState from cycle state
+			state, err := scheduling.ReadCycleStateKey[*PrefixCacheHitState](cycleState, plugin.StateKey(scorer.TypedName().String()))
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantHasCacheHit, state.HasCacheHit)
+			assert.Equal(t, tt.wantMaxRaw, state.MaxRawScore)
+		})
+	}
+}
+
+func TestConsumes_DeclaresTokenizedPromptKey(t *testing.T) {
+	scorer := &PrecisePrefixCacheScorer{
+		typedName:      plugin.TypedName{Type: PrecisePrefixCachePluginType, Name: "test"},
+		kvEventsConfig: &kvevents.Config{},
+	}
+
+	consumes := scorer.Consumes()
+	require.NotNil(t, consumes)
+	assert.Contains(t, consumes, "TokenizedPrompt")
+	assert.IsType(t, (*scheduling.TokenizedPrompt)(nil), consumes["TokenizedPrompt"])
+}
