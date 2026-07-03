@@ -151,6 +151,13 @@ type parameters struct {
 	// tokens (measured ~17x on H200/32B), so 100 output tokens occupy about
 	// 700-800 estimate units. Defaults to 750.
 	DecodeAllowanceTokens float64 `json:"decodeAllowanceTokens"`
+	// ResidencyAuthoritative treats event-fed session residency as engine
+	// truth: when a request carries a SessionResidency attribute, residency
+	// REPLACES response-fed coverage (pods absent from residency are cold —
+	// their KV was evicted). Sound when all traffic is identity-tagged.
+	// Default false: residency merges as per-endpoint maxima, which is safe
+	// under partial tagging but keeps stale belief alive across evictions.
+	ResidencyAuthoritative bool `json:"residencyAuthoritative"`
 }
 
 // compile-time type assertions
@@ -228,21 +235,22 @@ func New(ctx context.Context, name string, params parameters) *SessionCoverage {
 	}
 
 	s := &SessionCoverage{
-		typedName:       plugin.TypedName{Type: SessionCoverageScorerType, Name: name},
-		headerName:      headerName,
-		rootHeader:      rootHeader,
-		shareAsHeader:   shareAsHeader,
-		forkHeader:      forkHeader,
-		charsPerToken:   charsPerToken,
-		sessionTTL:      sessionTTL,
-		maxSessions:     maxSessions,
-		rolloverRatio:   rolloverRatio,
-		queueWeight:     queueWeight,
-		decodeAllowance: decodeAllowance,
-		now:             time.Now,
-		sessions:        map[string]*sessionEntry{},
-		inFlight:        map[string]*inFlightEntry{},
-		podLoad:         map[string]int64{},
+		typedName:              plugin.TypedName{Type: SessionCoverageScorerType, Name: name},
+		headerName:             headerName,
+		rootHeader:             rootHeader,
+		shareAsHeader:          shareAsHeader,
+		forkHeader:             forkHeader,
+		charsPerToken:          charsPerToken,
+		sessionTTL:             sessionTTL,
+		maxSessions:            maxSessions,
+		rolloverRatio:          rolloverRatio,
+		queueWeight:            queueWeight,
+		decodeAllowance:        decodeAllowance,
+		residencyAuthoritative: params.ResidencyAuthoritative,
+		now:                    time.Now,
+		sessions:               map[string]*sessionEntry{},
+		inFlight:               map[string]*inFlightEntry{},
+		podLoad:                map[string]int64{},
 	}
 	if ctx != nil {
 		go s.sweep(ctx)
@@ -263,8 +271,9 @@ type SessionCoverage struct {
 	maxSessions   int
 	rolloverRatio float64
 
-	queueWeight     float64
-	decodeAllowance float64
+	queueWeight            float64
+	decodeAllowance        float64
+	residencyAuthoritative bool
 
 	now func() time.Time
 
@@ -330,7 +339,7 @@ func (s *SessionCoverage) Score(ctx context.Context, request *fwksched.Inference
 	}
 
 	coverage := s.effectiveCoverage(ctx, sid, rootID, s.forkParent(request), x, attrsession.HasStructuralIdentity(request))
-	coverage = mergeResidency(request, endpoints, coverage)
+	coverage = s.mergeResidency(request, endpoints, coverage)
 
 	if s.queueWeight <= 0 {
 		// Pure affinity: covered fraction of the prompt, load left to other
@@ -533,7 +542,7 @@ func (s *SessionCoverage) PreRequest(ctx context.Context, request *fwksched.Infe
 	if s.queueWeight > 0 && request.RequestID != "" {
 		gap := x
 		coverage := s.effectiveCoverage(ctx, sid, s.headerValue(request, s.rootHeader), s.forkParent(request), x, attrsession.HasStructuralIdentity(request))
-		coverage = mergeResidency(request, primaryTargetEndpoints(schedulingResult), coverage)
+		coverage = s.mergeResidency(request, primaryTargetEndpoints(schedulingResult), coverage)
 		if c := coverage[pod]; c > 0 {
 			if c > x {
 				c = x
@@ -844,13 +853,17 @@ func primaryTargetEndpoints(result *fwksched.SchedulingResult) []fwksched.Endpoi
 	return profileResult.TargetEndpoints
 }
 
-// mergeResidency overlays event-fed session residency (eviction-aware,
-// engine units, published by the session-residency producer) onto the
-// response-fed coverage map, taking per-endpoint maxima. Residency pods are
-// keyed "addr:port" as on KV events and mapped to endpoint keys via endpoint
-// metadata. Maxima keep the composition safe while tagging is partial; once
-// all traffic is tagged, residency alone can carry the coverage.
-func mergeResidency(request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint, coverage map[string]int64) map[string]int64 {
+// mergeResidency folds event-fed session residency (eviction-aware, engine
+// units, published by the session-residency producer) into the response-fed
+// coverage map. Residency pods are keyed "addr:port" as on KV events and
+// mapped to endpoint keys via endpoint metadata.
+//
+// Default mode overlays per-endpoint maxima — safe under partial tagging but
+// stale belief survives evictions. In residencyAuthoritative mode a present
+// residency attribute REPLACES response-fed coverage: pods absent from
+// residency are cold, their KV was evicted. Requests without the attribute
+// fall back to response-fed coverage in both modes.
+func (s *SessionCoverage) mergeResidency(request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint, coverage map[string]int64) map[string]int64 {
 	residency, ok := attrsession.ReadSessionResidency(request)
 	if !ok || len(residency) == 0 {
 		return coverage
@@ -866,6 +879,9 @@ func mergeResidency(request *fwksched.InferenceRequest, endpoints []fwksched.End
 			byAddr[meta.Address+":"+meta.Port] = key
 		}
 		byAddr[key] = key
+	}
+	if s.residencyAuthoritative {
+		coverage = map[string]int64{}
 	}
 	for _, r := range residency {
 		key, ok := byAddr[r.Pod]

@@ -416,6 +416,42 @@ func TestResidencyMergesAsEngineTruth(t *testing.T) {
 	expectScore(t, scores, podB, 0.0)
 }
 
+func TestResidencyAuthoritativeReplacesBelief(t *testing.T) {
+	// Authoritative mode: a present residency attribute is engine truth.
+	// Response-fed belief that pod-a is warm dies when residency says the
+	// session's KV survives only on pod-b (pod-a evicted it).
+	s, _ := newTestScorer(parameters{ResidencyAuthoritative: true})
+	podA := fwksched.NewEndpoint(
+		&fwkdl.EndpointMetadata{
+			NamespacedName: k8stypes.NamespacedName{Namespace: "ns", Name: "pod-a"},
+			Address:        "10.0.0.1", Port: "8000",
+		}, &fwkdl.Metrics{}, nil)
+	podB := fwksched.NewEndpoint(
+		&fwkdl.EndpointMetadata{
+			NamespacedName: k8stypes.NamespacedName{Namespace: "ns", Name: "pod-b"},
+			Address:        "10.0.0.2", Port: "8000",
+		}, &fwkdl.Metrics{}, nil)
+
+	// Response-fed belief: warm on pod-a.
+	warm := chatRequest("s1", 4000)
+	s.PreRequest(context.Background(), warm, schedulingResultFor(podA))
+	s.ResponseBody(context.Background(), warm, endOfStreamResponse(1200, 100), podA.GetMetadata())
+
+	// Engine truth: only pod-b holds intact KV.
+	resume := chatRequest("s1", 4000) // estimate 1001
+	resume.PutAttribute(attrsession.SessionResidencyDataKey.String(),
+		[]attrsession.PodResidency{{Pod: "10.0.0.2:8000", Tier: "gpu", UpTo: "c2", Tokens: 800}})
+
+	scores := s.Score(context.Background(), resume, []fwksched.Endpoint{podA, podB})
+	expectScore(t, scores, podA, 0.0)
+	expectScore(t, scores, podB, 800.0/1001.0)
+
+	// Without the attribute, response-fed belief still applies (fallback).
+	blind := chatRequest("s1", 4000)
+	scores = s.Score(context.Background(), blind, []fwksched.Endpoint{podA, podB})
+	expectScore(t, scores, podA, 1.0)
+}
+
 func TestEstimatePromptTokens(t *testing.T) {
 	s, _ := newTestScorer(parameters{})
 
