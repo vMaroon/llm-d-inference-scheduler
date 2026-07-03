@@ -79,40 +79,52 @@ func getBlockHashes(ctx context.Context, request *scheduling.InferenceRequest, b
 	return result
 }
 
+// ChainSeed initializes a hash chain from the given parts (e.g. model name
+// and cache salt, or an identity version tag and per-tenant salt). Chains
+// seeded differently never collide on equal content. Empty parts contribute
+// nothing, matching a caller that skips them.
+func ChainSeed(parts ...string) uint64 {
+	h := xxhash.New()
+	for _, p := range parts {
+		_, _ = h.Write([]byte(p))
+	}
+	return h.Sum64()
+}
+
+// ChainHash extends a hash chain by one block: the block's content hash and
+// the previous chain value, hashed together. This is the chain algebra shared
+// by approximate prefix-cache block hashing and identity derivation (the
+// chain-identity producer), so both agree on what "same prefix" means.
+func ChainHash(prev uint64, block HashBlock) uint64 {
+	h := xxhash.New()
+	_, _ = h.Write(toBytes(block.Hash()))
+	_, _ = h.Write(toBytes(prev))
+	return h.Sum64()
+}
+
 // computeBlockHashes calculates the hash for content blocks.
 func computeBlockHashes(seq iter.Seq[HashBlock], request *scheduling.InferenceRequest, maxPrefixBlocks int) []blockHash {
 	var blockHashes []blockHash
 
-	h := xxhash.New()
 	// Different models should have different hashes even with the same body.
-	_, _ = h.Write([]byte(request.TargetModel))
-	if cacheSalt := request.Body.TokenizedPrompt.CacheSalt; cacheSalt != "" {
-		_, _ = h.Write([]byte(cacheSalt))
-	}
-
-	prevBlockHash := blockHash(h.Sum64())
+	prev := ChainSeed(request.TargetModel, request.Body.TokenizedPrompt.CacheSalt)
 
 	count := 0
 	for block := range seq {
 		if count >= maxPrefixBlocks {
 			break
 		}
-		h.Reset()
-		blockID := block.Hash()
-		_, _ = h.Write(toBytes(blockHash(blockID)))
-		_, _ = h.Write(toBytes(prevBlockHash))
-		blockHashes = append(blockHashes, blockHash(h.Sum64()))
-
-		prevBlockHash = blockHashes[len(blockHashes)-1]
+		prev = ChainHash(prev, block)
+		blockHashes = append(blockHashes, blockHash(prev))
 		count++
 	}
 
 	return blockHashes
 }
 
-func toBytes(i blockHash) []byte {
+func toBytes(i uint64) []byte {
 	bytes := make([]byte, 8)
-	binary.LittleEndian.PutUint64(bytes, uint64(i))
+	binary.LittleEndian.PutUint64(bytes, i)
 	return bytes
 }
 

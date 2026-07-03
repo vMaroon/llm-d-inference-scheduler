@@ -22,12 +22,26 @@ package session
 import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	chainidentityconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/chainidentity/constants"
 	sessionidconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/sessionid/constants"
 )
 
 // SessionIDDataKey identifies the session identifier published on the request
 // attribute store. The default producer is the session-id-producer.
 var SessionIDDataKey = plugin.NewDataKey("SessionIDDataKey", sessionidconstants.SessionIDProducerType)
+
+// ForkParentDataKey identifies the parent lineage id published by the
+// chain-identity producer when a request is discovered to fork from an
+// existing lineage: the child shares the parent's KV prefix and adopts its
+// coverage on first sight.
+var ForkParentDataKey = plugin.NewDataKey("ForkParentDataKey", chainidentityconstants.ChainIdentityProducerType)
+
+// StructuralIdentityDataKey marks requests whose session id is derived from
+// content chain hashes. For such requests a rewritten history yields a new
+// lineage id by construction, so heuristic rollover detection (prompt-shrink
+// ratios) must not fire — a short delta continuation would be mistaken for a
+// rewrite.
+var StructuralIdentityDataKey = plugin.NewDataKey("StructuralIdentityDataKey", chainidentityconstants.ChainIdentityProducerType)
 
 // SessionID is the session identifier extracted from a request.
 type SessionID string
@@ -42,4 +56,25 @@ type SessionID string
 func ReadSessionID(r *fwksched.InferenceRequest) (SessionID, bool) {
 	key := SessionIDDataKey.WithNonEmptyProducerName(sessionidconstants.SessionIDProducerType).String()
 	return fwksched.ReadRequestAttribute[SessionID](r, key)
+}
+
+// ReadDerivedSessionID returns the content-derived lineage id published by
+// the chain-identity producer, or "" and false if absent. Derived identity is
+// canonical when present: declared client ids alias it inside the producer.
+func ReadDerivedSessionID(r *fwksched.InferenceRequest) (SessionID, bool) {
+	key := SessionIDDataKey.WithNonEmptyProducerName(chainidentityconstants.ChainIdentityProducerType).String()
+	return fwksched.ReadRequestAttribute[SessionID](r, key)
+}
+
+// ReadForkParent returns the fork-parent lineage id published by the
+// chain-identity producer, or "" and false if absent.
+func ReadForkParent(r *fwksched.InferenceRequest) (SessionID, bool) {
+	return fwksched.ReadRequestAttribute[SessionID](r, ForkParentDataKey.String())
+}
+
+// HasStructuralIdentity reports whether the request's session id is derived
+// from content chain hashes (see StructuralIdentityDataKey).
+func HasStructuralIdentity(r *fwksched.InferenceRequest) bool {
+	v, ok := fwksched.ReadRequestAttribute[bool](r, StructuralIdentityDataKey.String())
+	return ok && v
 }

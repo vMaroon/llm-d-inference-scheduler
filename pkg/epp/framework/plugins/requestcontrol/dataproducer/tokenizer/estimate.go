@@ -243,6 +243,14 @@ func assetPlaceholderCount(dataLen int) int {
 	return 1
 }
 
+// PackBytes packs raw bytes into little-endian uint32 pseudo-tokens with a
+// zero-padded tail. Exported for reuse by identity derivation (the
+// chain-identity producer), which hashes framed content bytes through the
+// same packing the estimate backend uses for pseudo-tokenization.
+func PackBytes(raw []byte) []uint32 {
+	return packBytes(raw)
+}
+
 // packBytes packs bytes into little-endian uint32 tokens (zero-padded tail).
 // Reinterpreting them reproduces the input, so locality keys are unchanged.
 func packBytes(raw []byte) []uint32 {

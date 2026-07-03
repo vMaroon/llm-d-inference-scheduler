@@ -31,6 +31,7 @@ import (
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrsession "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/session"
+	chainidentityconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/chainidentity/constants"
 	sessionidconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/sessionid/constants"
 )
 
@@ -331,6 +332,66 @@ func TestSessionIDFromAttributePrecedesHeader(t *testing.T) {
 	s.mu.Unlock()
 	if !attrExists || headerExists {
 		t.Errorf("attribute session id should take precedence: attr=%v header=%v", attrExists, headerExists)
+	}
+}
+
+func TestDerivedSessionIDPrecedesAll(t *testing.T) {
+	s, _ := newTestScorer(parameters{})
+	podA := newEndpoint("pod-a")
+
+	request := chatRequest("header-session", 4000)
+	request.PutAttribute(
+		attrsession.SessionIDDataKey.WithNonEmptyProducerName(sessionidconstants.SessionIDProducerType).String(),
+		attrsession.SessionID("attr-session"))
+	request.PutAttribute(
+		attrsession.SessionIDDataKey.WithNonEmptyProducerName(chainidentityconstants.ChainIdentityProducerType).String(),
+		attrsession.SessionID("chain-session"))
+
+	s.PreRequest(context.Background(), request, schedulingResultFor(podA))
+
+	s.mu.Lock()
+	_, chainExists := s.sessions["chain-session"]
+	_, attrExists := s.sessions["attr-session"]
+	s.mu.Unlock()
+	if !chainExists || attrExists {
+		t.Errorf("derived chain id must take precedence: chain=%v attr=%v", chainExists, attrExists)
+	}
+}
+
+func TestStructuralIdentitySkipsRollover(t *testing.T) {
+	// Chain-derived ids re-key rewritten histories by construction; a delta
+	// continuation's small prompt must not trip the shrink heuristic.
+	s, _ := newTestScorer(parameters{})
+	podA := newEndpoint("pod-a")
+
+	s.PreRequest(context.Background(), chatRequest("s1", 40000), schedulingResultFor(podA)) // est 10001
+
+	small := chatRequest("s1", 8000) // est 2001 < 0.5 * 10001
+	small.PutAttribute(attrsession.StructuralIdentityDataKey.String(), true)
+	scores := s.Score(context.Background(), small, []fwksched.Endpoint{podA})
+	expectScore(t, scores, podA, 1.0)
+
+	s.mu.Lock()
+	_, exists := s.sessions["s1"]
+	s.mu.Unlock()
+	if !exists {
+		t.Error("structural identity must suppress heuristic rollover")
+	}
+}
+
+func TestForkParentAttributeAdoption(t *testing.T) {
+	s, _ := newTestScorer(parameters{})
+	podA := newEndpoint("pod-a")
+
+	parent := chatRequest("parent", 4000)
+	s.PreRequest(context.Background(), parent, schedulingResultFor(podA))
+	s.ResponseBody(context.Background(), parent, endOfStreamResponse(1200, 100), podA.GetMetadata())
+
+	child := chatRequest("child", 4400)
+	child.PutAttribute(attrsession.ForkParentDataKey.String(), attrsession.SessionID("parent"))
+	scores := s.Score(context.Background(), child, []fwksched.Endpoint{podA})
+	if scores[podA] <= 0 {
+		t.Fatalf("fork-parent attribute must adopt the parent's coverage: %v", scores)
 	}
 }
 

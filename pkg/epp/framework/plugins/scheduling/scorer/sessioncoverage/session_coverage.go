@@ -329,7 +329,7 @@ func (s *SessionCoverage) Score(ctx context.Context, request *fwksched.Inference
 		return scores
 	}
 
-	coverage := s.effectiveCoverage(ctx, sid, rootID, s.headerValue(request, s.forkHeader), x)
+	coverage := s.effectiveCoverage(ctx, sid, rootID, s.forkParent(request), x, attrsession.HasStructuralIdentity(request))
 
 	if s.queueWeight <= 0 {
 		// Pure affinity: covered fraction of the prompt, load left to other
@@ -432,7 +432,10 @@ func (s *SessionCoverage) decrementLoadLocked(entry *inFlightEntry) {
 // request: the session's own coverage (after fork adoption and rollover
 // handling) overlaid with the referenced shared root's coverage, taking the
 // per-endpoint maximum. It returns nil when neither source is known.
-func (s *SessionCoverage) effectiveCoverage(ctx context.Context, sid, rootID, forkFrom string, promptTokens int64) map[string]int64 {
+// structural disables heuristic rollover: chain-derived ids re-key rewritten
+// histories by construction, and a delta continuation's small prompt must
+// not be mistaken for a rewrite.
+func (s *SessionCoverage) effectiveCoverage(ctx context.Context, sid, rootID, forkFrom string, promptTokens int64, structural bool) map[string]int64 {
 	now := s.now()
 
 	s.mu.Lock()
@@ -442,7 +445,7 @@ func (s *SessionCoverage) effectiveCoverage(ctx context.Context, sid, rootID, fo
 
 	if sid != "" {
 		entry := s.ownEntryLocked(sid, forkFrom)
-		if entry != nil && s.rolloverRatio > 0 {
+		if entry != nil && s.rolloverRatio > 0 && !structural {
 			if best := entry.maxPromptEst; best > 0 && float64(promptTokens) < s.rolloverRatio*float64(best) {
 				// The prompt shrank well below the session's known prefix: the
 				// history was rewritten (e.g. compaction). The old KV no longer
@@ -528,7 +531,7 @@ func (s *SessionCoverage) PreRequest(ctx context.Context, request *fwksched.Infe
 	// covered prefixes queue no prefill work.
 	if s.queueWeight > 0 && request.RequestID != "" {
 		gap := x
-		coverage := s.effectiveCoverage(ctx, sid, s.headerValue(request, s.rootHeader), s.headerValue(request, s.forkHeader), x)
+		coverage := s.effectiveCoverage(ctx, sid, s.headerValue(request, s.rootHeader), s.forkParent(request), x, attrsession.HasStructuralIdentity(request))
 		if c := coverage[pod]; c > 0 {
 			if c > x {
 				c = x
@@ -541,7 +544,7 @@ func (s *SessionCoverage) PreRequest(ctx context.Context, request *fwksched.Infe
 		return
 	}
 	if sid != "" {
-		s.bump(ctx, sid, pod, x, x, s.headerValue(request, s.forkHeader))
+		s.bump(ctx, sid, pod, x, x, s.forkParent(request))
 	}
 	if shareAs != "" {
 		// The declaring request's placement is where the root will live; an
@@ -594,7 +597,7 @@ func (s *SessionCoverage) accountResponse(ctx context.Context, request *fwksched
 	}
 	pod := targetEndpoint.NamespacedName.String()
 	if sid != "" {
-		s.bump(ctx, sid, pod, total, 0, s.headerValue(request, s.forkHeader))
+		s.bump(ctx, sid, pod, total, 0, s.forkParent(request))
 	}
 	// Roots grow by served prompts only: completions belong to the requester,
 	// not the shared prefix. A child's prompt extends past the root by its
@@ -706,6 +709,15 @@ func (s *SessionCoverage) removeExpired() {
 	}
 }
 
+// forkParent resolves the request's fork-parent id: the chain-identity
+// producer's discovered parent when present, then the configured header.
+func (s *SessionCoverage) forkParent(request *fwksched.InferenceRequest) string {
+	if id, ok := attrsession.ReadForkParent(request); ok && id != "" {
+		return string(id)
+	}
+	return s.headerValue(request, s.forkHeader)
+}
+
 // headerValue returns the trimmed value of the named request header.
 func (s *SessionCoverage) headerValue(request *fwksched.InferenceRequest, name string) string {
 	if request == nil || request.Headers == nil || name == "" {
@@ -714,12 +726,17 @@ func (s *SessionCoverage) headerValue(request *fwksched.InferenceRequest, name s
 	return strings.TrimSpace(request.Headers[name])
 }
 
-// sessionID resolves the request's session id: the session-id-producer
-// attribute when present, then the configured request header, then the Dynamo
-// nvext.session_control dialect carried in the request body.
+// sessionID resolves the request's session id: the chain-identity producer's
+// derived lineage id when present (canonical — declared ids alias it inside
+// the producer), then the session-id-producer attribute, then the configured
+// request header, then the Dynamo nvext.session_control dialect carried in
+// the request body.
 func (s *SessionCoverage) sessionID(request *fwksched.InferenceRequest) string {
 	if request == nil {
 		return ""
+	}
+	if id, ok := attrsession.ReadDerivedSessionID(request); ok && id != "" {
+		return string(id)
 	}
 	if id, ok := attrsession.ReadSessionID(request); ok && id != "" {
 		return string(id)
