@@ -293,15 +293,37 @@ func contentBlocks(body *fwkrh.InferenceRequestBody) [][]byte {
 		return blocks
 
 	case body.Completions != nil:
-		text := body.Completions.Prompt.PlainText()
-		if text == "" {
-			return nil
-		}
-		return [][]byte{frameString(frameString(nil, "prompt"), text)}
+		return rawPromptBlocks("prompt", body.Completions.Prompt.PlainText())
 
 	default:
 		return nil
 	}
+}
+
+// rawBlockBytes is the chunk size for unstructured (completions-style)
+// prompts, which carry no message boundaries to anchor on: ~256 estimated
+// tokens at 4 bytes/token, the only boundary raw text offers.
+const rawBlockBytes = 1024
+
+// rawPromptBlocks chunks an unstructured prompt into fixed-size framed
+// blocks. The trailing partial chunk is EXCLUDED from identity: it is still
+// growing, and dropping it keeps turn N's chain a strict prefix of turn
+// N+1's — a conversation replayed as raw text extends its own lineage
+// instead of forking off it every turn. Prompts shorter than one chunk
+// derive no identity (consumers fall back to declared ids).
+func rawPromptBlocks(label, text string) [][]byte {
+	if len(text) < rawBlockBytes {
+		return nil
+	}
+	data := []byte(text)
+	var blocks [][]byte
+	for len(data) >= rawBlockBytes {
+		b := frameString(nil, label)
+		b = frame(b, data[:rawBlockBytes])
+		blocks = append(blocks, b)
+		data = data[rawBlockBytes:]
+	}
+	return blocks
 }
 
 // messageBlock frames one message: role, then each content part as

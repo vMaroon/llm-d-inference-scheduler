@@ -221,6 +221,58 @@ func TestPublishesStructuralMarker(t *testing.T) {
 	}
 }
 
+func completionsReq(model, prompt string) *fwksched.InferenceRequest {
+	return &fwksched.InferenceRequest{
+		TargetModel: model,
+		Headers:     map[string]string{},
+		Body: &fwkrh.InferenceRequestBody{
+			Completions: &fwkrh.CompletionsRequest{Prompt: fwkrh.Prompt{Raw: prompt}},
+		},
+	}
+}
+
+func TestCompletionsChunkedContinuation(t *testing.T) {
+	// Raw-text conversations (completions API) chunk at fixed boundaries with
+	// the growing tail excluded, so each turn extends its own lineage.
+	p := newProducer("")
+	turn1 := completionsReq("m", strings.Repeat("a", 2600))
+	produce(t, p, turn1)
+
+	turn2 := completionsReq("m", strings.Repeat("a", 2600)+strings.Repeat("b", 1500))
+	produce(t, p, turn2)
+	if derivedID(t, turn2) != derivedID(t, turn1) {
+		t.Errorf("a grown raw prompt must extend its lineage: %s vs %s", derivedID(t, turn2), derivedID(t, turn1))
+	}
+	if _, ok := attrsession.ReadForkParent(turn2); ok {
+		t.Error("a grown raw prompt is an extension, not a fork")
+	}
+}
+
+func TestCompletionsSharedRootFork(t *testing.T) {
+	p := newProducer("")
+	shared := strings.Repeat("s", 2048)
+	a := completionsReq("m", shared+strings.Repeat("x", 1500))
+	produce(t, p, a)
+	b := completionsReq("m", shared+strings.Repeat("y", 1500))
+	produce(t, p, b)
+
+	if derivedID(t, a) == derivedID(t, b) {
+		t.Fatal("raw prompts sharing a root must not share identity")
+	}
+	forkFrom, ok := attrsession.ReadForkParent(b)
+	if !ok || string(forkFrom) != derivedID(t, a) {
+		t.Errorf("shared raw root must fork: parent = %q, want %q", forkFrom, derivedID(t, a))
+	}
+}
+
+func TestCompletionsTinyPromptNoIdentity(t *testing.T) {
+	r := completionsReq("m", "short prompt")
+	produce(t, newProducer(""), r)
+	if _, ok := attrsession.ReadDerivedSessionID(r); ok {
+		t.Error("sub-chunk prompts must derive no identity")
+	}
+}
+
 // --- lineage integration with the session-coverage scorer ---
 
 func newScorer(t *testing.T) *sessioncoverage.SessionCoverage {
