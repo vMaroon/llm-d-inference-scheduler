@@ -210,6 +210,24 @@ func TestFramingUnambiguous(t *testing.T) {
 	}
 }
 
+func TestStampsOutboundPayload(t *testing.T) {
+	// The producer writes (session_tag, continuation_id) into the parsed
+	// payload so the pipeline re-serializes them toward the engine.
+	p := newProducer("")
+	r := chatReq("m", [2]string{"system", "sys"}, [2]string{"user", "hello"})
+	r.Body.Payload = fwkrh.PayloadMap(map[string]any{"model": "m"})
+	produce(t, p, r)
+
+	payload, _ := r.Body.Payload.AsMap()
+	if payload["session_tag"] != derivedID(t, r) {
+		t.Errorf("session_tag = %v, want the lineage id %s", payload["session_tag"], derivedID(t, r))
+	}
+	cont, _ := payload["continuation_id"].(string)
+	if len(cont) != 16 {
+		t.Errorf("continuation_id must be a 16-hex chain head, got %q", cont)
+	}
+}
+
 func TestPublishesStructuralMarker(t *testing.T) {
 	r := chatReq("m", [2]string{"user", "hello"})
 	produce(t, newProducer(""), r)

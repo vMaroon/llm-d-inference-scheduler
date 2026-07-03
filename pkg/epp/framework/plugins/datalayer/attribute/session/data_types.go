@@ -24,6 +24,7 @@ import (
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	chainidentityconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/chainidentity/constants"
 	sessionidconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/sessionid/constants"
+	sessionresidencyconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/sessionresidency/constants"
 )
 
 // SessionIDDataKey identifies the session identifier published on the request
@@ -77,4 +78,27 @@ func ReadForkParent(r *fwksched.InferenceRequest) (SessionID, bool) {
 func HasStructuralIdentity(r *fwksched.InferenceRequest) bool {
 	v, ok := fwksched.ReadRequestAttribute[bool](r, StructuralIdentityDataKey.String())
 	return ok && v
+}
+
+// SessionResidencyDataKey identifies event-fed session residency published by
+// the session-residency producer: per pod, the engine-unit token count of the
+// session's intact (eviction-aware) resident prefix.
+var SessionResidencyDataKey = plugin.NewDataKey("SessionResidencyDataKey", sessionresidencyconstants.SessionResidencyProducerType)
+
+// PodResidency is one pod's event-fed residency for the request's session.
+type PodResidency struct {
+	// Pod is the engine identifier as it appears on KV events ("addr:port").
+	Pod string
+	// Tier is the device tier of the deepest intact segment.
+	Tier string
+	// UpTo is the deepest continuation id whose prefix is fully resident.
+	UpTo string
+	// Tokens is the engine-unit token count of the intact resident prefix.
+	Tokens int
+}
+
+// ReadSessionResidency returns the event-fed residency for the request's
+// session, or nil and false if absent.
+func ReadSessionResidency(r *fwksched.InferenceRequest) ([]PodResidency, bool) {
+	return fwksched.ReadRequestAttribute[[]PodResidency](r, SessionResidencyDataKey.String())
 }

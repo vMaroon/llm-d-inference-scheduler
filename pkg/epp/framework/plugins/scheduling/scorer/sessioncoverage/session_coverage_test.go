@@ -395,6 +395,27 @@ func TestForkParentAttributeAdoption(t *testing.T) {
 	}
 }
 
+func TestResidencyMergesAsEngineTruth(t *testing.T) {
+	// Event-fed residency (keyed addr:port as on KV events) overlays the
+	// response-fed coverage: a session unknown to the scorer's own index
+	// still scores warm on the pod the events say holds its KV.
+	s, _ := newTestScorer(parameters{})
+	podA := fwksched.NewEndpoint(
+		&fwkdl.EndpointMetadata{
+			NamespacedName: k8stypes.NamespacedName{Namespace: "ns", Name: "pod-a"},
+			Address:        "10.0.0.1", Port: "8000",
+		}, &fwkdl.Metrics{}, nil)
+	podB := newEndpoint("pod-b")
+
+	request := chatRequest("s1", 4000) // estimate 1001, session unknown
+	request.PutAttribute(attrsession.SessionResidencyDataKey.String(),
+		[]attrsession.PodResidency{{Pod: "10.0.0.1:8000", Tier: "gpu", UpTo: "c3", Tokens: 900}})
+
+	scores := s.Score(context.Background(), request, []fwksched.Endpoint{podA, podB})
+	expectScore(t, scores, podA, 900.0/1001.0)
+	expectScore(t, scores, podB, 0.0)
+}
+
 func TestEstimatePromptTokens(t *testing.T) {
 	s, _ := newTestScorer(parameters{})
 

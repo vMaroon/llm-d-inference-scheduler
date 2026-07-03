@@ -330,6 +330,7 @@ func (s *SessionCoverage) Score(ctx context.Context, request *fwksched.Inference
 	}
 
 	coverage := s.effectiveCoverage(ctx, sid, rootID, s.forkParent(request), x, attrsession.HasStructuralIdentity(request))
+	coverage = mergeResidency(request, endpoints, coverage)
 
 	if s.queueWeight <= 0 {
 		// Pure affinity: covered fraction of the prompt, load left to other
@@ -532,6 +533,7 @@ func (s *SessionCoverage) PreRequest(ctx context.Context, request *fwksched.Infe
 	if s.queueWeight > 0 && request.RequestID != "" {
 		gap := x
 		coverage := s.effectiveCoverage(ctx, sid, s.headerValue(request, s.rootHeader), s.forkParent(request), x, attrsession.HasStructuralIdentity(request))
+		coverage = mergeResidency(request, primaryTargetEndpoints(schedulingResult), coverage)
 		if c := coverage[pod]; c > 0 {
 			if c > x {
 				c = x
@@ -819,16 +821,63 @@ func (s *SessionCoverage) estimatePromptTokens(request *fwksched.InferenceReques
 // primaryTargetPod returns the namespaced name of the primary profile's first
 // target endpoint, or "" when unavailable.
 func primaryTargetPod(result *fwksched.SchedulingResult) string {
-	if result == nil {
+	endpoints := primaryTargetEndpoints(result)
+	if len(endpoints) == 0 {
 		return ""
 	}
-	profileResult, ok := result.ProfileResults[result.PrimaryProfileName]
-	if !ok || profileResult == nil || len(profileResult.TargetEndpoints) == 0 {
-		return ""
-	}
-	metadata := profileResult.TargetEndpoints[0].GetMetadata()
+	metadata := endpoints[0].GetMetadata()
 	if metadata == nil {
 		return ""
 	}
 	return metadata.NamespacedName.String()
+}
+
+// primaryTargetEndpoints returns the primary profile's target endpoints.
+func primaryTargetEndpoints(result *fwksched.SchedulingResult) []fwksched.Endpoint {
+	if result == nil {
+		return nil
+	}
+	profileResult, ok := result.ProfileResults[result.PrimaryProfileName]
+	if !ok || profileResult == nil {
+		return nil
+	}
+	return profileResult.TargetEndpoints
+}
+
+// mergeResidency overlays event-fed session residency (eviction-aware,
+// engine units, published by the session-residency producer) onto the
+// response-fed coverage map, taking per-endpoint maxima. Residency pods are
+// keyed "addr:port" as on KV events and mapped to endpoint keys via endpoint
+// metadata. Maxima keep the composition safe while tagging is partial; once
+// all traffic is tagged, residency alone can carry the coverage.
+func mergeResidency(request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint, coverage map[string]int64) map[string]int64 {
+	residency, ok := attrsession.ReadSessionResidency(request)
+	if !ok || len(residency) == 0 {
+		return coverage
+	}
+	byAddr := make(map[string]string, 2*len(endpoints))
+	for _, endpoint := range endpoints {
+		meta := endpoint.GetMetadata()
+		if meta == nil {
+			continue
+		}
+		key := meta.NamespacedName.String()
+		if meta.Address != "" {
+			byAddr[meta.Address+":"+meta.Port] = key
+		}
+		byAddr[key] = key
+	}
+	for _, r := range residency {
+		key, ok := byAddr[r.Pod]
+		if !ok || r.Tokens <= 0 {
+			continue
+		}
+		if coverage == nil {
+			coverage = map[string]int64{}
+		}
+		if int64(r.Tokens) > coverage[key] {
+			coverage[key] = int64(r.Tokens)
+		}
+	}
+	return coverage
 }

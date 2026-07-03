@@ -198,7 +198,27 @@ func (p *Producer) Produce(_ context.Context, request *fwksched.InferenceRequest
 		request.PutAttribute(p.forkKey, attrsession.SessionID(res.ForkParent))
 	}
 	request.PutAttribute(p.structuralKey, true)
+	// Stamp the outbound request so session-tagged engines echo the pair on
+	// KV events: session_tag = the lineage id, continuation_id = the chain
+	// head this request extends to. The gateway re-serializes the mutated
+	// payload; engines without the patch tolerate and ignore both fields.
+	stampOutbound(request, res.LineageID, chain[len(chain)-1])
 	return nil
+}
+
+// stampOutbound writes the session labels into the parsed request payload,
+// which the request pipeline re-serializes toward the model server. Requests
+// whose payloads were not parsed into a map are left untouched.
+func stampOutbound(request *fwksched.InferenceRequest, lineageID string, head uint64) {
+	if request.Body == nil || request.Body.Payload == nil {
+		return
+	}
+	payload, ok := request.Body.Payload.AsMap()
+	if !ok {
+		return
+	}
+	payload["session_tag"] = lineageID
+	payload["continuation_id"] = fmt.Sprintf("%016x", head)
 }
 
 // chain folds the framed content blocks into append ids: the reused
