@@ -150,4 +150,4 @@ require (
 	sigs.k8s.io/randfill v1.0.0 // indirect
 )
 
-replace github.com/llm-d/llm-d-kv-cache => github.com/vMaroon/llm-d-kv-cache v0.0.0-20260703203041-314c15c277ac
+replace github.com/llm-d/llm-d-kv-cache => github.com/vMaroon/llm-d-kv-cache v0.0.0-20260703231537-25f1b191926d
