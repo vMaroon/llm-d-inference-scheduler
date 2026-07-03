@@ -493,9 +493,13 @@ func (s *SessionCoverage) ownEntryLocked(sid, forkFrom string) *sessionEntry {
 	if !ok {
 		return nil
 	}
+	// The child adopts the parent's coverage but NOT its prompt-estimate
+	// high-water: rollover is a per-lineage signal, and a sub-agent's first
+	// prompt (shared root + task) is routinely far below half the parent's
+	// full history. Inheriting maxPromptEst would misfire rollover on every
+	// such fork and delete the adopted coverage on first scoring.
 	entry := &sessionEntry{
-		coverage:     make(map[string]int64, len(parent.coverage)),
-		maxPromptEst: parent.maxPromptEst,
+		coverage: make(map[string]int64, len(parent.coverage)),
 	}
 	for pod, c := range parent.coverage {
 		entry.coverage[pod] = c
@@ -558,10 +562,27 @@ func (s *SessionCoverage) ResponseBody(ctx context.Context, request *fwksched.In
 	if request != nil && request.RequestID != "" {
 		s.releaseInFlight(request.RequestID)
 	}
+	sid := s.sessionID(request)
+	s.accountResponse(ctx, request, response, targetEndpoint, sid)
+
+	// A declared final turn (Dynamo dialect action "close") releases the
+	// session's index entry once its response has been accounted. The
+	// declaration ends the lineage, not the accounting: release must run even
+	// when the response carries no usage (streams without include_usage) or
+	// no endpoint.
+	if sid != "" {
+		if _, action := dynamoSessionControl(request); action == "close" {
+			s.release(sid)
+		}
+	}
+}
+
+// accountResponse raises coverage from the response's reported usage. It is a
+// no-op for responses without usage or a known serving endpoint.
+func (s *SessionCoverage) accountResponse(ctx context.Context, request *fwksched.InferenceRequest, response *requestcontrol.Response, targetEndpoint *datalayer.EndpointMetadata, sid string) {
 	if targetEndpoint == nil {
 		return
 	}
-	sid := s.sessionID(request)
 	shareAs := s.headerValue(request, s.shareAsHeader)
 	rootID := s.headerValue(request, s.rootHeader)
 	if sid == "" && shareAs == "" && rootID == "" {
@@ -584,14 +605,6 @@ func (s *SessionCoverage) ResponseBody(ctx context.Context, request *fwksched.In
 		}
 		if rootID != "" {
 			s.bump(ctx, rootKeyPrefix+rootID, pod, prompt, 0, "")
-		}
-	}
-
-	// A declared final turn (Dynamo dialect action "close") releases the
-	// session's index entry once its response has been accounted.
-	if sid != "" {
-		if _, action := dynamoSessionControl(request); action == "close" {
-			s.release(sid)
 		}
 	}
 

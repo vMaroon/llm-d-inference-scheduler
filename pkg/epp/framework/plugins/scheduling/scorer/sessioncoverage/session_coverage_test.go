@@ -439,6 +439,55 @@ func TestForkAdoptsParentCoverage(t *testing.T) {
 	expectScore(t, parentScores, podB, 0.0)
 }
 
+func TestForkWithSmallerPromptKeepsAdoptedCoverage(t *testing.T) {
+	// Regression: a sub-agent's first prompt (shared root + task) is routinely
+	// far below half the parent's full history. Inheriting the parent's prompt
+	// high-water made rollover treat the fork as a rewrite and delete the
+	// adopted entry on first scoring, permanently.
+	s, _ := newTestScorer(parameters{})
+	podA, podB := newEndpoint("pod-a"), newEndpoint("pod-b")
+
+	parent := chatRequest("parent", 40000) // estimate 10001
+	s.PreRequest(context.Background(), parent, schedulingResultFor(podA))
+	s.ResponseBody(context.Background(), parent, endOfStreamResponse(24000, 500), podA.GetMetadata())
+
+	// Fork estimate 3251 < 0.5 * 10001: adoption must survive, not roll over.
+	fork := withHeader(chatRequest("fork-1", 13000), defaultForkHeaderName, "parent")
+	scores := s.Score(context.Background(), fork, []fwksched.Endpoint{podA, podB})
+	expectScore(t, scores, podA, 1.0)
+	expectScore(t, scores, podB, 0.0)
+
+	s.mu.Lock()
+	_, exists := s.sessions["fork-1"]
+	s.mu.Unlock()
+	if !exists {
+		t.Error("fork entry must survive its first scoring")
+	}
+}
+
+func TestForkRolloverUsesOwnHistory(t *testing.T) {
+	// Rollover still protects the fork once its OWN prompt high-water exists.
+	s, _ := newTestScorer(parameters{})
+	podA := newEndpoint("pod-a")
+
+	parent := chatRequest("parent", 40000)
+	s.PreRequest(context.Background(), parent, schedulingResultFor(podA))
+
+	fork := withHeader(chatRequest("fork-1", 20000), defaultForkHeaderName, "parent") // est 5001
+	s.PreRequest(context.Background(), fork, schedulingResultFor(podA))
+
+	// The fork's history is rewritten: est 2001 < 0.5 * 5001.
+	scores := s.Score(context.Background(), chatRequest("fork-1", 8000), []fwksched.Endpoint{podA})
+	expectScore(t, scores, podA, 0.0)
+
+	s.mu.Lock()
+	_, exists := s.sessions["fork-1"]
+	s.mu.Unlock()
+	if exists {
+		t.Error("fork entry should be removed after its own rollover")
+	}
+}
+
 // costScenario builds a warm shared root on pod-a: the parent declared root R
 // (est 12001), completed, and left no in-flight work.
 func costScenario(t *testing.T) (*SessionCoverage, fwksched.Endpoint, fwksched.Endpoint) {
@@ -570,6 +619,38 @@ func TestDynamoCloseReleasesSession(t *testing.T) {
 	s.mu.Unlock()
 	if exists {
 		t.Error("close action must release the session entry")
+	}
+}
+
+func TestDynamoCloseReleasesWithoutUsage(t *testing.T) {
+	// Regression: a close on a stream without include_usage arrives with zero
+	// usage in the final chunk. The declaration ends the lineage, not the
+	// accounting — release must not sit behind the usage early-return.
+	s, _ := newTestScorer(parameters{})
+	podA := newEndpoint("pod-a")
+
+	bindTurn := dynamoRequest("conv-1", "bind", 4000)
+	s.PreRequest(context.Background(), bindTurn, schedulingResultFor(podA))
+
+	closeTurn := dynamoRequest("conv-1", "close", 4400)
+	s.ResponseBody(context.Background(), closeTurn, endOfStreamResponse(0, 0), podA.GetMetadata())
+
+	s.mu.Lock()
+	_, exists := s.sessions["conv-1"]
+	s.mu.Unlock()
+	if exists {
+		t.Error("close must release the session even when the response carries no usage")
+	}
+
+	// Same for a response with no resolved endpoint metadata.
+	s.PreRequest(context.Background(), bindTurn, schedulingResultFor(podA))
+	s.ResponseBody(context.Background(), dynamoRequest("conv-1", "close", 4400), endOfStreamResponse(1000, 50), nil)
+
+	s.mu.Lock()
+	_, exists = s.sessions["conv-1"]
+	s.mu.Unlock()
+	if exists {
+		t.Error("close must release the session even without endpoint metadata")
 	}
 }
 
