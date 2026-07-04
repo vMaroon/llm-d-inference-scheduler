@@ -149,13 +149,16 @@ func indexedCoverage(s *SessionCoverage, sid string, endpoint fwksched.Endpoint)
 	return entry.coverage[podKey(endpoint)], true
 }
 
-func TestScoreNoSessionID(t *testing.T) {
+func TestScoreNoSessionIDIsNeutral(t *testing.T) {
 	s, _ := newTestScorer(parameters{})
-	podA := newEndpoint("pod-a")
+	podA, podB := newEndpoint("pod-a"), newEndpoint("pod-b")
 
-	scores := s.Score(context.Background(), chatRequest("", 4000), []fwksched.Endpoint{podA})
+	// Identity-less traffic flows through the cost path (so the sacrificial
+	// term reaches it); with no load and no mass attribute it is neutral.
+	scores := s.Score(context.Background(), chatRequest("", 4000), []fwksched.Endpoint{podA, podB})
 
-	expectScore(t, scores, podA, 0.0)
+	expectScore(t, scores, podA, 0.5)
+	expectScore(t, scores, podB, 0.5)
 }
 
 func TestScoreUnknownSessionIsNeutral(t *testing.T) {
@@ -446,6 +449,82 @@ func TestSacrificialPlacementSteersFreshTraffic(t *testing.T) {
 	}
 }
 
+func TestPackingPrefersSessionDensePodForFirstTurn(t *testing.T) {
+	// A session's first turn (identity, no coverage anywhere) is discounted
+	// toward pods already holding protected session mass: equal load, pod-a
+	// holds 50k of session KV, pod-b holds 2k — the new session lands on
+	// pod-a, keeping pod-b free to absorb unaffiliated churn.
+	s, _ := newTestScorer(parameters{QueueWeight: 1, PackingWeight: 0.5})
+	podA := newAddressedEndpoint("pod-a", "10.0.0.1")
+	podB := newAddressedEndpoint("pod-b", "10.0.0.2")
+	mass := map[string]int{"10.0.0.1:8000": 50000, "10.0.0.2:8000": 2000}
+
+	first := chatRequest("s-new", 4000)
+	first.PutAttribute(attrsession.PodProtectedMassDataKey.String(), mass)
+	scores := s.Score(context.Background(), first, []fwksched.Endpoint{podA, podB})
+	if scores[podA] <= scores[podB] {
+		t.Fatalf("session start must prefer the session-dense pod: %v", scores)
+	}
+}
+
+func TestPackingRespectsCap(t *testing.T) {
+	// A pod at or above packingCapTokens attracts no further session starts:
+	// it earns no discount, tying with a mass-less pod, while the massiest
+	// under-cap pod wins.
+	s, _ := newTestScorer(parameters{QueueWeight: 1, PackingWeight: 0.5, PackingCapTokens: 100000})
+	podA := newAddressedEndpoint("pod-a", "10.0.0.1")
+	podB := newAddressedEndpoint("pod-b", "10.0.0.2")
+	podC := newAddressedEndpoint("pod-c", "10.0.0.3")
+	mass := map[string]int{"10.0.0.1:8000": 120000, "10.0.0.2:8000": 50000, "10.0.0.3:8000": 0}
+
+	first := chatRequest("s-new", 4000)
+	first.PutAttribute(attrsession.PodProtectedMassDataKey.String(), mass)
+	scores := s.Score(context.Background(), first, []fwksched.Endpoint{podA, podB, podC})
+	if scores[podB] <= scores[podA] || scores[podB] <= scores[podC] {
+		t.Fatalf("the massiest under-cap pod must win: %v", scores)
+	}
+	if math.Abs(scores[podA]-scores[podC]) > testEpsilon {
+		t.Errorf("an over-cap pod must earn no discount: pod-a=%v pod-c=%v", scores[podA], scores[podC])
+	}
+}
+
+func TestPackingRequiresSessionIdentity(t *testing.T) {
+	// One-shot traffic without session identity never packs: the sacrificial
+	// term still steers it away from session-dense pods, even with packing
+	// enabled alongside.
+	s, _ := newTestScorer(parameters{QueueWeight: 1, SacrificialWeight: 0.5, PackingWeight: 0.5})
+	podA := newAddressedEndpoint("pod-a", "10.0.0.1")
+	podB := newAddressedEndpoint("pod-b", "10.0.0.2")
+	mass := map[string]int{"10.0.0.1:8000": 50000, "10.0.0.2:8000": 2000}
+
+	oneShot := chatRequest("", 4000)
+	oneShot.PutAttribute(attrsession.PodProtectedMassDataKey.String(), mass)
+	scores := s.Score(context.Background(), oneShot, []fwksched.Endpoint{podA, podB})
+	if scores[podB] <= scores[podA] {
+		t.Fatalf("identity-less traffic must still avoid session mass: %v", scores)
+	}
+}
+
+func TestPackingLeavesWarmSessionsAlone(t *testing.T) {
+	// A session with coverage follows its own KV even when another pod holds
+	// far more protected mass: packing only shapes first turns.
+	s, _ := newTestScorer(parameters{QueueWeight: 1, PackingWeight: 0.5})
+	podA := newAddressedEndpoint("pod-a", "10.0.0.1")
+	podB := newAddressedEndpoint("pod-b", "10.0.0.2")
+	mass := map[string]int{"10.0.0.1:8000": 50000, "10.0.0.2:8000": 2000}
+
+	warm := chatRequest("agent-1", 4000)
+	s.PreRequest(context.Background(), warm, schedulingResultFor(podB))
+	s.ResponseBody(context.Background(), warm, endOfStreamResponse(1200, 100), podB.GetMetadata())
+
+	followup := chatRequest("agent-1", 4400)
+	followup.PutAttribute(attrsession.PodProtectedMassDataKey.String(), mass)
+	scores := s.Score(context.Background(), followup, []fwksched.Endpoint{podA, podB})
+	if scores[podB] <= scores[podA] {
+		t.Fatalf("warm session must follow its own KV, not the mass: %v", scores)
+	}
+}
+
 func TestEstimatePromptTokens(t *testing.T) {
 	s, _ := newTestScorer(parameters{})
 
@@ -572,7 +651,8 @@ func TestFactoryDefaults(t *testing.T) {
 	}
 	if s.headerName != defaultHeaderName || s.charsPerToken != defaultCharsPerToken ||
 		s.sessionTTL != defaultSessionTTL || s.maxSessions != defaultMaxSessions ||
-		s.queueWeight != defaultQueueWeight {
+		s.queueWeight != defaultQueueWeight ||
+		s.packingWeight != 0 || s.packingCapTokens != defaultPackingCap {
 		t.Errorf("Factory defaults not applied: %+v", s)
 	}
 	if s.TypedName().Type != SessionCoverageScorerType {

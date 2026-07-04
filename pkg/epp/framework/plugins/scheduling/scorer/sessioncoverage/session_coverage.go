@@ -52,8 +52,12 @@ limitations under the License.
 // PreRequest/ResponseBody, so it is fresh under bursts where scraped metrics
 // lag. Per request, costs are normalized to [0, 1] scores (lowest cost scores
 // highest). With no coverage anywhere placement degrades to
-// least-estimated-load, optionally biased away from pods holding protected
-// session KV (sacrificialWeight).
+// least-estimated-load, shaped by two protected-mass biases: affinity-less
+// traffic is steered away from pods holding protected session KV
+// (sacrificialWeight), while a session's first turn is packed toward pods
+// already holding session mass (packingWeight, bounded by packingCapTokens)
+// so the least-mass pod stays naturally session-free — the designated
+// sacrifice for unaffiliated churn.
 package sessioncoverage
 
 import (
@@ -85,6 +89,7 @@ const (
 	defaultMaxSessions     = 100_000
 	defaultQueueWeight     = 1.0
 	defaultDecodeAllowance = 750.0
+	defaultPackingCap      = 180_000
 
 	// inFlightTTL bounds how long an in-flight accounting entry may live
 	// without its response arriving (crashed streams, dropped clients).
@@ -139,6 +144,19 @@ type parameters struct {
 	// PodProtectedMass attribute (session-residency producer). Default 0
 	// (off).
 	SacrificialWeight float64 `json:"sacrificialWeight"`
+	// PackingWeight discounts each endpoint's protected session mass from
+	// the cost of SESSION STARTS (requests carrying session identity with no
+	// coverage anywhere): new sessions prefer pods that already hold session
+	// mass, keeping N-1 pods session-dense and leaving the least-mass pod
+	// naturally session-free — the designated sacrifice for unaffiliated
+	// churn, whose resumes never queue behind it. The complement of
+	// SacrificialWeight; uses the same PodProtectedMass attribute. Default 0
+	// (off).
+	PackingWeight float64 `json:"packingWeight"`
+	// PackingCapTokens bounds packing: an endpoint whose protected mass is
+	// at or above this many engine-unit tokens attracts no further session
+	// starts, so packing never overloads a pod. Defaults to 180000.
+	PackingCapTokens int64 `json:"packingCapTokens"`
 }
 
 // compile-time type assertions
@@ -198,6 +216,10 @@ func New(ctx context.Context, name string, params parameters) *SessionCoverage {
 	if decodeAllowance < 0 {
 		decodeAllowance = 0
 	}
+	packingCap := params.PackingCapTokens
+	if packingCap <= 0 {
+		packingCap = defaultPackingCap
+	}
 
 	s := &SessionCoverage{
 		typedName:              plugin.TypedName{Type: SessionCoverageScorerType, Name: name},
@@ -209,6 +231,8 @@ func New(ctx context.Context, name string, params parameters) *SessionCoverage {
 		decodeAllowance:        decodeAllowance,
 		residencyAuthoritative: params.ResidencyAuthoritative,
 		sacrificialWeight:      math.Max(0, params.SacrificialWeight),
+		packingWeight:          math.Max(0, params.PackingWeight),
+		packingCapTokens:       packingCap,
 		now:                    time.Now,
 		sessions:               map[string]*sessionEntry{},
 		inFlight:               map[string]*inFlightEntry{},
@@ -233,6 +257,8 @@ type SessionCoverage struct {
 	decodeAllowance        float64
 	residencyAuthoritative bool
 	sacrificialWeight      float64
+	packingWeight          float64
+	packingCapTokens       int64
 
 	now func() time.Time
 
@@ -274,7 +300,8 @@ func (s *SessionCoverage) Category() fwksched.ScorerCategory {
 
 // Score prices each endpoint on the placement-cost continuum and normalizes
 // the costs to [0, 1] scores (lowest cost scores highest). Requests without
-// session identity or a usable prompt estimate score zero everywhere.
+// a usable prompt estimate score zero everywhere; identity-less requests are
+// priced by load and protected mass alone.
 func (s *SessionCoverage) Score(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) map[fwksched.Endpoint]float64 {
 	scores := make(map[fwksched.Endpoint]float64, len(endpoints))
 	for _, endpoint := range endpoints {
@@ -282,9 +309,6 @@ func (s *SessionCoverage) Score(ctx context.Context, request *fwksched.Inference
 	}
 
 	sid := s.sessionID(request)
-	if sid == "" {
-		return scores
-	}
 	x := s.estimatePromptTokens(request)
 	if x <= 0 {
 		return scores
@@ -296,12 +320,17 @@ func (s *SessionCoverage) Score(ctx context.Context, request *fwksched.Inference
 	// Placement cost (continuum between longest-prefix-match and
 	// least-loaded): cost_e = gap_e + queueWeight * inflight_e, all in
 	// estimated-token units. A warm endpoint loses its edge once the work
-	// queued on it outweighs the prefill it saves; with no coverage anywhere
-	// this degrades to least-estimated-load placement — optionally biased
-	// away from pods holding protected session KV (sacrificial placement):
-	// pressure from unaffiliated traffic is quarantined deliberately.
+	// queued on it outweighs the prefill it saves. With no coverage anywhere
+	// this degrades to least-estimated-load placement, shaped by two
+	// protected-mass biases: affinity-less traffic pays for each pod's
+	// protected session KV (sacrificial placement — cache pressure is
+	// quarantined on the pod with the least to lose), and a session's first
+	// turn earns that mass back as a discount while the pod is under the
+	// packing cap (session packing — new sessions land where session KV
+	// already lives, so the least-mass pod stays session-free).
 	load := s.podLoadSnapshot()
 	sacrificial := s.sacrificialMass(request, endpoints, coverage)
+	packing := s.packingMass(request, endpoints, coverage, sid)
 	costs := make(map[fwksched.Endpoint]float64, len(endpoints))
 	minCost, maxCost := math.Inf(1), math.Inf(-1)
 	for _, endpoint := range endpoints {
@@ -316,6 +345,11 @@ func (s *SessionCoverage) Score(ctx context.Context, request *fwksched.Inference
 		cost := float64(x-c) + s.queueWeight*float64(load[key])
 		if sacrificial != nil {
 			cost += s.sacrificialWeight * float64(sacrificial[key])
+		}
+		if packing != nil {
+			if m := packing[key]; m < s.packingCapTokens {
+				cost -= s.packingWeight * float64(m)
+			}
 		}
 		costs[endpoint] = cost
 		minCost = math.Min(minCost, cost)
@@ -684,14 +718,40 @@ func primaryTargetEndpoints(result *fwksched.SchedulingResult) []fwksched.Endpoi
 // is session traffic following its own KV; only unaffiliated traffic is
 // steered away from session-heavy pods.
 func (s *SessionCoverage) sacrificialMass(request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint, coverage map[string]int64) map[string]int64 {
-	if s.sacrificialWeight <= 0 {
+	if s.sacrificialWeight <= 0 || hasCoverage(coverage) {
 		return nil
 	}
+	return protectedMassByEndpoint(request, endpoints)
+}
+
+// packingMass returns per-endpoint protected session mass for SESSION STARTS
+// when packing is enabled: the request carries session identity but has no
+// coverage anywhere (its first turn), so it is discounted toward pods
+// already holding session mass instead of spreading by load alone — the
+// least-mass pod stays session-free as the designated sacrifice. Nil
+// otherwise; warm sessions follow their own KV, identity-less traffic sees
+// only the sacrificial term.
+func (s *SessionCoverage) packingMass(request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint, coverage map[string]int64, sid string) map[string]int64 {
+	if s.packingWeight <= 0 || sid == "" || hasCoverage(coverage) {
+		return nil
+	}
+	return protectedMassByEndpoint(request, endpoints)
+}
+
+// hasCoverage reports whether any endpoint holds positive coverage.
+func hasCoverage(coverage map[string]int64) bool {
 	for _, c := range coverage {
 		if c > 0 {
-			return nil
+			return true
 		}
 	}
+	return false
+}
+
+// protectedMassByEndpoint maps the request's per-pod protected session mass
+// (PodProtectedMass attribute, keyed "addr:port" as on KV events) to
+// endpoint keys, or nil when the attribute is absent.
+func protectedMassByEndpoint(request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) map[string]int64 {
 	mass, ok := attrsession.ReadPodProtectedMass(request)
 	if !ok || len(mass) == 0 {
 		return nil
