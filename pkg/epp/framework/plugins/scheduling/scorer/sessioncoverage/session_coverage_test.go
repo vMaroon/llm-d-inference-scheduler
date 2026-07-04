@@ -452,6 +452,42 @@ func TestResidencyAuthoritativeReplacesBelief(t *testing.T) {
 	expectScore(t, scores, podA, 1.0)
 }
 
+func TestSacrificialPlacementSteersFreshTraffic(t *testing.T) {
+	// Affinity-less traffic pays for each pod's protected session mass:
+	// equal load, pod-a holds 50k of session KV, pod-b holds 2k — fresh
+	// one-shot requests go to pod-b. Session traffic is unaffected.
+	s, _ := newTestScorer(parameters{QueueWeight: 1, SacrificialWeight: 0.5})
+	podA := fwksched.NewEndpoint(
+		&fwkdl.EndpointMetadata{
+			NamespacedName: k8stypes.NamespacedName{Namespace: "ns", Name: "pod-a"},
+			Address:        "10.0.0.1", Port: "8000",
+		}, &fwkdl.Metrics{}, nil)
+	podB := fwksched.NewEndpoint(
+		&fwkdl.EndpointMetadata{
+			NamespacedName: k8stypes.NamespacedName{Namespace: "ns", Name: "pod-b"},
+			Address:        "10.0.0.2", Port: "8000",
+		}, &fwkdl.Metrics{}, nil)
+	mass := map[string]int{"10.0.0.1:8000": 50000, "10.0.0.2:8000": 2000}
+
+	fresh := chatRequest("one-shot", 4000)
+	fresh.PutAttribute(attrsession.PodProtectedMassDataKey.String(), mass)
+	scores := s.Score(context.Background(), fresh, []fwksched.Endpoint{podA, podB})
+	if scores[podB] <= scores[podA] {
+		t.Fatalf("fresh traffic must prefer the low-mass pod: %v", scores)
+	}
+
+	// A session with coverage on the heavy pod still follows its KV.
+	warm := chatRequest("agent-1", 4000)
+	s.PreRequest(context.Background(), warm, schedulingResultFor(podA))
+	s.ResponseBody(context.Background(), warm, endOfStreamResponse(1200, 100), podA.GetMetadata())
+	followup := chatRequest("agent-1", 4400)
+	followup.PutAttribute(attrsession.PodProtectedMassDataKey.String(), mass)
+	scores = s.Score(context.Background(), followup, []fwksched.Endpoint{podA, podB})
+	if scores[podA] <= scores[podB] {
+		t.Fatalf("session traffic must still follow its own KV: %v", scores)
+	}
+}
+
 func TestEstimatePromptTokens(t *testing.T) {
 	s, _ := newTestScorer(parameters{})
 

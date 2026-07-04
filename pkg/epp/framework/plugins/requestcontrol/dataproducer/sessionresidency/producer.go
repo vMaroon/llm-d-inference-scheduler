@@ -158,13 +158,17 @@ func (p *Producer) Produces() map[fwkplugin.DataKey]any {
 	return map[fwkplugin.DataKey]any{p.dk: []attrsession.PodResidency{}}
 }
 
-// Produce publishes the event-fed residency for the request's session. The
-// derived (chain) id is preferred — it is the value stamped outbound as
-// session_tag, so event labels and lookups share one keyspace; the declared
-// session attribute is the fallback for deployments without derivation.
+// Produce publishes the event-fed residency for the request's session and
+// the fleet's per-pod protected mass. The derived (chain) id is preferred —
+// it is the value stamped outbound as session_tag, so event labels and
+// lookups share one keyspace; the declared session attribute is the fallback
+// for deployments without derivation.
 func (p *Producer) Produce(_ context.Context, request *fwksched.InferenceRequest, _ []fwksched.Endpoint) error {
 	if request == nil {
 		return nil
+	}
+	if mass := p.view.PodMass(); len(mass) > 0 {
+		request.PutAttribute(attrsession.PodProtectedMassDataKey.String(), mass)
 	}
 	sid := ""
 	if id, ok := attrsession.ReadDerivedSessionID(request); ok && id != "" {

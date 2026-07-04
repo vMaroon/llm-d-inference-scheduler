@@ -158,6 +158,14 @@ type parameters struct {
 	// Default false: residency merges as per-endpoint maxima, which is safe
 	// under partial tagging but keeps stale belief alive across evictions.
 	ResidencyAuthoritative bool `json:"residencyAuthoritative"`
+	// SacrificialWeight prices each endpoint's protected session mass into
+	// the cost of AFFINITY-LESS requests (no coverage anywhere): fresh and
+	// one-shot traffic is steered toward pods with the least session KV to
+	// lose, quarantining cache pressure deliberately instead of by placement
+	// accident. Requests with any affinity are unaffected. Uses the
+	// PodProtectedMass attribute (session-residency producer). Default 0
+	// (off).
+	SacrificialWeight float64 `json:"sacrificialWeight"`
 }
 
 // compile-time type assertions
@@ -247,6 +255,7 @@ func New(ctx context.Context, name string, params parameters) *SessionCoverage {
 		queueWeight:            queueWeight,
 		decodeAllowance:        decodeAllowance,
 		residencyAuthoritative: params.ResidencyAuthoritative,
+		sacrificialWeight:      math.Max(0, params.SacrificialWeight),
 		now:                    time.Now,
 		sessions:               map[string]*sessionEntry{},
 		inFlight:               map[string]*inFlightEntry{},
@@ -274,6 +283,7 @@ type SessionCoverage struct {
 	queueWeight            float64
 	decodeAllowance        float64
 	residencyAuthoritative bool
+	sacrificialWeight      float64
 
 	now func() time.Time
 
@@ -364,8 +374,11 @@ func (s *SessionCoverage) Score(ctx context.Context, request *fwksched.Inference
 	// least-loaded): cost_e = gap_e + queueWeight * inflight_e, all in
 	// estimated-token units. A warm endpoint loses its edge once the work
 	// queued on it outweighs the prefill it saves; with no coverage anywhere
-	// this degrades to least-estimated-load placement.
+	// this degrades to least-estimated-load placement — optionally biased
+	// away from pods holding protected session KV (sacrificial placement):
+	// pressure from unaffiliated traffic is quarantined deliberately.
 	load := s.podLoadSnapshot()
+	sacrificial := s.sacrificialMass(request, endpoints, coverage)
 	costs := make(map[fwksched.Endpoint]float64, len(endpoints))
 	minCost, maxCost := math.Inf(1), math.Inf(-1)
 	for _, endpoint := range endpoints {
@@ -378,6 +391,9 @@ func (s *SessionCoverage) Score(ctx context.Context, request *fwksched.Inference
 			}
 		}
 		cost := float64(x-c) + s.queueWeight*float64(load[key])
+		if sacrificial != nil {
+			cost += s.sacrificialWeight * float64(sacrificial[key])
+		}
 		costs[endpoint] = cost
 		minCost = math.Min(minCost, cost)
 		maxCost = math.Max(maxCost, cost)
@@ -851,6 +867,38 @@ func primaryTargetEndpoints(result *fwksched.SchedulingResult) []fwksched.Endpoi
 		return nil
 	}
 	return profileResult.TargetEndpoints
+}
+
+// sacrificialMass returns per-endpoint protected session mass (engine
+// units, keyed by endpoint name) for AFFINITY-LESS requests when sacrificial
+// placement is enabled, nil otherwise. A request with any coverage anywhere
+// is session traffic following its own KV; only unaffiliated traffic is
+// steered away from session-heavy pods.
+func (s *SessionCoverage) sacrificialMass(request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint, coverage map[string]int64) map[string]int64 {
+	if s.sacrificialWeight <= 0 {
+		return nil
+	}
+	for _, c := range coverage {
+		if c > 0 {
+			return nil
+		}
+	}
+	mass, ok := attrsession.ReadPodProtectedMass(request)
+	if !ok || len(mass) == 0 {
+		return nil
+	}
+	out := make(map[string]int64, len(endpoints))
+	for _, endpoint := range endpoints {
+		meta := endpoint.GetMetadata()
+		if meta == nil {
+			continue
+		}
+		key := meta.NamespacedName.String()
+		if meta.Address != "" {
+			out[key] = int64(mass[meta.Address+":"+meta.Port])
+		}
+	}
+	return out
 }
 
 // mergeResidency folds event-fed session residency (eviction-aware, engine

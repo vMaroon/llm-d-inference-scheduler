@@ -102,3 +102,15 @@ type PodResidency struct {
 func ReadSessionResidency(r *fwksched.InferenceRequest) ([]PodResidency, bool) {
 	return fwksched.ReadRequestAttribute[[]PodResidency](r, SessionResidencyDataKey.String())
 }
+
+// PodProtectedMassDataKey identifies the per-pod protected session mass
+// published by the session-residency producer: engine-unit tokens of intact
+// session KV per pod (keyed "addr:port" as on KV events). Placement policies
+// use it to steer unaffiliated traffic toward pods with the least to lose.
+var PodProtectedMassDataKey = plugin.NewDataKey("PodProtectedMassDataKey", sessionresidencyconstants.SessionResidencyProducerType)
+
+// ReadPodProtectedMass returns the per-pod protected session mass, or nil
+// and false if absent.
+func ReadPodProtectedMass(r *fwksched.InferenceRequest) (map[string]int, bool) {
+	return fwksched.ReadRequestAttribute[map[string]int](r, PodProtectedMassDataKey.String())
+}
