@@ -98,6 +98,16 @@ type Parameters struct {
 	LineageTTLSeconds int `json:"lineageTTLSeconds"`
 	// MaxLineages caps the number of tracked lineages. Defaults to 100000.
 	MaxLineages int `json:"maxLineages"`
+	// RetainTTLSeconds, when positive, stamps requests that CONTINUE a known
+	// lineage with a KV retention directive (vLLM context-aware retention,
+	// vllm-project/vllm#38514): the full prompt range is biased against
+	// eviction for this many seconds, scoped to the lineage id. One-shot
+	// traffic (fresh lineages) is never retained. This is the Phase-4
+	// bootstrap: a ttl-bounded eviction bias, never a pin. Default 0 (off).
+	RetainTTLSeconds int `json:"retainTTLSeconds"`
+	// RetainPriority is the eviction priority (0-100) used with
+	// RetainTTLSeconds. Defaults to 80.
+	RetainPriority int `json:"retainPriority"`
 }
 
 var _ requestcontrol.DataProducer = &Producer{}
@@ -105,13 +115,15 @@ var _ requestcontrol.DataProducer = &Producer{}
 // Producer derives chain-hash session identity for each request and
 // publishes it on the request attribute store.
 type Producer struct {
-	typedName     fwkplugin.TypedName
-	sessionKey    string
-	forkKey       string
-	structuralKey string
-	tenantSalt    string
-	headerName    string
-	index         *lineageIndex
+	typedName      fwkplugin.TypedName
+	sessionKey     string
+	forkKey        string
+	structuralKey  string
+	tenantSalt     string
+	headerName     string
+	retainTTL      int
+	retainPriority int
+	index          *lineageIndex
 }
 
 // Factory builds a Producer from raw plugin parameters.
@@ -145,17 +157,23 @@ func New(ctx context.Context, name string, params Parameters) *Producer {
 	if maxLineages <= 0 {
 		maxLineages = defaultMaxLineages
 	}
+	retainPriority := params.RetainPriority
+	if retainPriority <= 0 || retainPriority > 100 {
+		retainPriority = 80
+	}
 
 	p := &Producer{
 		typedName: fwkplugin.TypedName{Type: ChainIdentityProducerType, Name: name},
 		// Attribute keys are built with the producer TYPE, not the instance
 		// name, so readers need not guess how the instance was named.
-		sessionKey:    attrsession.SessionIDDataKey.WithNonEmptyProducerName(ChainIdentityProducerType).String(),
-		forkKey:       attrsession.ForkParentDataKey.String(),
-		structuralKey: attrsession.StructuralIdentityDataKey.String(),
-		tenantSalt:    params.TenantSalt,
-		headerName:    headerName,
-		index:         newLineageIndex(ttl, maxLineages),
+		sessionKey:     attrsession.SessionIDDataKey.WithNonEmptyProducerName(ChainIdentityProducerType).String(),
+		forkKey:        attrsession.ForkParentDataKey.String(),
+		structuralKey:  attrsession.StructuralIdentityDataKey.String(),
+		tenantSalt:     params.TenantSalt,
+		headerName:     headerName,
+		retainTTL:      params.RetainTTLSeconds,
+		retainPriority: retainPriority,
+		index:          newLineageIndex(ttl, maxLineages),
 	}
 	if ctx != nil {
 		go p.sweep(ctx)
@@ -203,7 +221,33 @@ func (p *Producer) Produce(_ context.Context, request *fwksched.InferenceRequest
 	// head this request extends to. The gateway re-serializes the mutated
 	// payload; engines without the patch tolerate and ignore both fields.
 	stampOutbound(request, res.LineageID, chain[len(chain)-1])
+	// Phase-4 bootstrap: sessions that CONTINUE known KV state retain their
+	// prompt against eviction for the pause window (ttl-bounded bias, never
+	// a pin). One-shot traffic gets nothing — under memory pressure it takes
+	// the eviction hit instead of the paused sessions.
+	if p.retainTTL > 0 && res.Continued {
+		stampRetention(request, res.LineageID, p.retainPriority, p.retainTTL)
+	}
 	return nil
+}
+
+// stampRetention writes a full-prompt KV retention directive (vLLM
+// context-aware retention) scoped to the lineage id.
+func stampRetention(request *fwksched.InferenceRequest, lineageID string, priority, ttlSeconds int) {
+	if request.Body == nil || request.Body.Payload == nil {
+		return
+	}
+	payload, ok := request.Body.Payload.AsMap()
+	if !ok {
+		return
+	}
+	payload["retention_directives"] = []any{map[string]any{
+		"start":    0,
+		"end":      nil,
+		"priority": priority,
+		"duration": float64(ttlSeconds),
+	}}
+	payload["retention_scope"] = lineageID
 }
 
 // stampOutbound writes the session labels into the parsed request payload,

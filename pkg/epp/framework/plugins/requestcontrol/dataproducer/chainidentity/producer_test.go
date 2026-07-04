@@ -228,6 +228,38 @@ func TestStampsOutboundPayload(t *testing.T) {
 	}
 }
 
+func TestRetentionStampedOnlyForContinuations(t *testing.T) {
+	//nolint:staticcheck // nil context intentionally skips the background sweeper in tests.
+	p := chainidentity.New(nil, "test", chainidentity.Parameters{RetainTTLSeconds: 150, RetainPriority: 80})
+
+	// Fresh lineage (one-shot traffic): no retention.
+	fresh := chatReq("m", [2]string{"system", "sys"}, [2]string{"user", "u1"})
+	fresh.Body.Payload = fwkrh.PayloadMap(map[string]any{"model": "m"})
+	produce(t, p, fresh)
+	payload, _ := fresh.Body.Payload.AsMap()
+	if _, ok := payload["retention_directives"]; ok {
+		t.Fatal("fresh lineages must not be retained")
+	}
+
+	// Continuation: retained, scoped to the lineage.
+	turn2 := chatReq("m", [2]string{"system", "sys"}, [2]string{"user", "u1"},
+		[2]string{"assistant", "a1"}, [2]string{"user", "u2"})
+	turn2.Body.Payload = fwkrh.PayloadMap(map[string]any{"model": "m"})
+	produce(t, p, turn2)
+	payload, _ = turn2.Body.Payload.AsMap()
+	directives, ok := payload["retention_directives"].([]any)
+	if !ok || len(directives) != 1 {
+		t.Fatalf("continuation must carry one retention directive: %v", payload["retention_directives"])
+	}
+	d := directives[0].(map[string]any)
+	if d["priority"] != 80 || d["duration"] != float64(150) || d["start"] != 0 || d["end"] != nil {
+		t.Errorf("directive = %v, want full-prompt priority 80 for 150s", d)
+	}
+	if payload["retention_scope"] != derivedID(t, turn2) {
+		t.Errorf("retention_scope must be the lineage id")
+	}
+}
+
 func TestPublishesStructuralMarker(t *testing.T) {
 	r := chatReq("m", [2]string{"user", "hello"})
 	produce(t, newProducer(""), r)

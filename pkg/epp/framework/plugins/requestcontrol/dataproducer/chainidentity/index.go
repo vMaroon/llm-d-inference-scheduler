@@ -47,6 +47,11 @@ type resolution struct {
 	// ForkParent is the parent lineage id when this request was discovered
 	// to fork from an existing lineage; empty otherwise.
 	ForkParent string
+	// Continued reports that the request extends KV state that already
+	// existed (continuation, replay, extension, delta alias, or fork from a
+	// known parent) — as opposed to a fresh lineage. Policies use it to
+	// discriminate ongoing sessions from one-shot traffic.
+	Continued bool
 }
 
 // lineageIndex resolves content chains to lineages. All state is
@@ -115,7 +120,7 @@ func (x *lineageIndex) resolve(chain []uint64, declared string) resolution {
 		if declared != "" {
 			if l, ok := x.aliases[declared]; ok && len(chain) < l.chainLen {
 				l.lastSeen = now
-				return resolution{LineageID: l.id}
+				return resolution{LineageID: l.id, Continued: true}
 			}
 		}
 		l := x.newLineageLocked(chain, 0, now)
@@ -130,7 +135,7 @@ func (x *lineageIndex) resolve(chain []uint64, declared string) resolution {
 		if declared != "" {
 			x.aliases[declared] = owner
 		}
-		return resolution{LineageID: owner.id}
+		return resolution{LineageID: owner.id, Continued: true}
 
 	case chain[idx] == owner.head:
 		// Linear extension of the owner's main line.
@@ -144,7 +149,7 @@ func (x *lineageIndex) resolve(chain []uint64, declared string) resolution {
 		if declared != "" {
 			x.aliases[declared] = owner
 		}
-		return resolution{LineageID: owner.id}
+		return resolution{LineageID: owner.id, Continued: true}
 
 	default:
 		// Divergence from a mid-chain append: a fork, discovered structurally.
@@ -153,7 +158,7 @@ func (x *lineageIndex) resolve(chain []uint64, declared string) resolution {
 		if declared != "" {
 			x.aliases[declared] = f
 		}
-		return resolution{LineageID: f.id, ForkParent: owner.id}
+		return resolution{LineageID: f.id, ForkParent: owner.id, Continued: true}
 	}
 }
 
