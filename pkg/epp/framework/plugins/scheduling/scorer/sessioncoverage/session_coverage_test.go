@@ -46,11 +46,6 @@ func (c *fakeClock) now() time.Time { return c.t }
 func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
 
 func newTestScorer(params parameters) (*SessionCoverage, *fakeClock) {
-	if params.QueueWeight == 0 {
-		// Most tests pin the pure-affinity scoring mode; load-cost tests opt
-		// in with an explicit positive QueueWeight.
-		params.QueueWeight = -1
-	}
 	clock := &fakeClock{t: time.Unix(1_000_000, 0)}
 	//nolint:staticcheck // nil context intentionally skips the background sweeper in tests.
 	s := New(nil, "test", params)
@@ -69,6 +64,16 @@ func newEndpoint(name string) fwksched.Endpoint {
 		&fwkdl.Metrics{},
 		nil,
 	)
+}
+
+// newAddressedEndpoint builds an endpoint carrying an address, so attributes
+// keyed "addr:port" as on KV events (residency, protected mass) resolve to it.
+func newAddressedEndpoint(name, address string) fwksched.Endpoint {
+	return fwksched.NewEndpoint(
+		&fwkdl.EndpointMetadata{
+			NamespacedName: k8stypes.NamespacedName{Namespace: "ns", Name: name},
+			Address:        address, Port: "8000",
+		}, &fwkdl.Metrics{}, nil)
 }
 
 func podKey(endpoint fwksched.Endpoint) string {
@@ -92,6 +97,14 @@ func chatRequest(sid string, chars int) *fwksched.InferenceRequest {
 			},
 		},
 	}
+}
+
+// forkChild builds a request for its own session that names a fork parent
+// via the chain-identity attribute.
+func forkChild(sid, parent string, chars int) *fwksched.InferenceRequest {
+	r := chatRequest(sid, chars)
+	r.PutAttribute(attrsession.ForkParentDataKey.String(), attrsession.SessionID(parent))
+	return r
 }
 
 func schedulingResultFor(endpoint fwksched.Endpoint) *fwksched.SchedulingResult {
@@ -124,6 +137,18 @@ func expectScore(t *testing.T, scores map[fwksched.Endpoint]float64, endpoint fw
 	}
 }
 
+// indexedCoverage reads the session's coverage on the endpoint straight from
+// the index; ok reports whether the session has an entry at all.
+func indexedCoverage(s *SessionCoverage, sid string, endpoint fwksched.Endpoint) (tokens int64, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.sessions[sid]
+	if !ok {
+		return 0, false
+	}
+	return entry.coverage[podKey(endpoint)], true
+}
+
 func TestScoreNoSessionID(t *testing.T) {
 	s, _ := newTestScorer(parameters{})
 	podA := newEndpoint("pod-a")
@@ -133,13 +158,15 @@ func TestScoreNoSessionID(t *testing.T) {
 	expectScore(t, scores, podA, 0.0)
 }
 
-func TestScoreUnknownSession(t *testing.T) {
+func TestScoreUnknownSessionIsNeutral(t *testing.T) {
 	s, _ := newTestScorer(parameters{})
-	podA := newEndpoint("pod-a")
+	podA, podB := newEndpoint("pod-a"), newEndpoint("pod-b")
 
-	scores := s.Score(context.Background(), chatRequest("s1", 4000), []fwksched.Endpoint{podA})
+	// No coverage, no load: every endpoint carries the same cost.
+	scores := s.Score(context.Background(), chatRequest("s1", 4000), []fwksched.Endpoint{podA, podB})
 
-	expectScore(t, scores, podA, 0.0)
+	expectScore(t, scores, podA, 0.5)
+	expectScore(t, scores, podB, 0.5)
 }
 
 func TestPreRequestThenScore(t *testing.T) {
@@ -149,100 +176,46 @@ func TestPreRequestThenScore(t *testing.T) {
 	// Turn 1: 4000 chars => 1001 estimated tokens, scheduled to pod-a.
 	s.PreRequest(context.Background(), chatRequest("s1", 4000), schedulingResultFor(podA))
 
-	// Turn 2: 4800 chars => 1201 estimated tokens.
+	// Turn 2: the covered endpoint carries the lowest cost.
 	scores := s.Score(context.Background(), chatRequest("s1", 4800), []fwksched.Endpoint{podA, podB})
 
-	expectScore(t, scores, podA, 1001.0/1201.0)
+	expectScore(t, scores, podA, 1.0)
 	expectScore(t, scores, podB, 0.0)
 }
 
 func TestResponseBodyOverridesEstimate(t *testing.T) {
 	s, _ := newTestScorer(parameters{})
 	podA := newEndpoint("pod-a")
-	request := chatRequest("s1", 4000)
+	request := chatRequest("s1", 4000) // estimate 1001
 
 	s.PreRequest(context.Background(), request, schedulingResultFor(podA))
 	s.ResponseBody(context.Background(), request, endOfStreamResponse(1100, 100), podA.GetMetadata())
 
-	// Coverage is now 1200 ground-truth tokens.
-	scores := s.Score(context.Background(), chatRequest("s1", 5200), []fwksched.Endpoint{podA}) // 1301 tokens
-	expectScore(t, scores, podA, 1200.0/1301.0)
+	if c, ok := indexedCoverage(s, "s1", podA); !ok || c != 1200 {
+		t.Fatalf("coverage = %d (exists=%v), want ground-truth 1200 over the 1001 estimate", c, ok)
+	}
 
 	// A smaller, stale usage report must not shrink coverage.
 	s.ResponseBody(context.Background(), request, endOfStreamResponse(400, 100), podA.GetMetadata())
-	scores = s.Score(context.Background(), chatRequest("s1", 5200), []fwksched.Endpoint{podA})
-	expectScore(t, scores, podA, 1200.0/1301.0)
+	if c, _ := indexedCoverage(s, "s1", podA); c != 1200 {
+		t.Errorf("coverage = %d after stale report, want 1200", c)
+	}
 }
 
 func TestScoreClampsToFullCoverage(t *testing.T) {
 	s, _ := newTestScorer(parameters{})
-	podA := newEndpoint("pod-a")
-	request := chatRequest("s1", 4000)
+	podA, podB, podC := newEndpoint("pod-a"), newEndpoint("pod-b"), newEndpoint("pod-c")
 
-	s.ResponseBody(context.Background(), request, endOfStreamResponse(1800, 200), podA.GetMetadata())
+	// pod-a holds 2000 tokens, pod-b exactly the request's 1001 estimate.
+	// Overshooting coverage clamps to the prompt: both cost zero gap and tie,
+	// while the cold pod loses.
+	s.ResponseBody(context.Background(), chatRequest("s1", 4000), endOfStreamResponse(1800, 200), podA.GetMetadata())
+	s.ResponseBody(context.Background(), chatRequest("s1", 4000), endOfStreamResponse(901, 100), podB.GetMetadata())
 
-	// 4000 chars => 1001 tokens; coverage 2000 > X, at the rollover boundary
-	// (1001 >= 0.5*2000) so no reset, and the fraction clamps to 1.0.
-	scores := s.Score(context.Background(), chatRequest("s1", 4000), []fwksched.Endpoint{podA})
+	scores := s.Score(context.Background(), chatRequest("s1", 4000), []fwksched.Endpoint{podA, podB, podC})
 	expectScore(t, scores, podA, 1.0)
-}
-
-func TestRolloverResetsSession(t *testing.T) {
-	s, _ := newTestScorer(parameters{})
-	podA := newEndpoint("pod-a")
-	request := chatRequest("s1", 40000) // estimate 10001
-
-	s.PreRequest(context.Background(), request, schedulingResultFor(podA))
-	s.ResponseBody(context.Background(), request, endOfStreamResponse(9500, 500), podA.GetMetadata())
-
-	// Prompt estimate shrinks to 2001 < 0.5 * 10001: rollover.
-	scores := s.Score(context.Background(), chatRequest("s1", 8000), []fwksched.Endpoint{podA})
-	expectScore(t, scores, podA, 0.0)
-
-	s.mu.Lock()
-	_, exists := s.sessions["s1"]
-	s.mu.Unlock()
-	if exists {
-		t.Error("session entry should be removed after rollover")
-	}
-}
-
-func TestRolloverComparesEstimateUnitsNotUsageUnits(t *testing.T) {
-	// Regression: usage-reported tokens can run well above the router-side
-	// estimate (token-dense text). A growing conversation must not be
-	// mistaken for a prefix rewrite just because estimate < usage coverage.
-	s, _ := newTestScorer(parameters{})
-	podA := newEndpoint("pod-a")
-	turn1 := chatRequest("s1", 4000) // estimate 1001
-
-	s.PreRequest(context.Background(), turn1, schedulingResultFor(podA))
-	// Real tokenizer reports ~2.4x the estimate.
-	s.ResponseBody(context.Background(), turn1, endOfStreamResponse(2400, 24), podA.GetMetadata())
-
-	// Turn 2 grows the text; estimate 1201 is still far below usage coverage
-	// 2424. No rollover may fire, and the covered pod scores full.
-	scores := s.Score(context.Background(), chatRequest("s1", 4800), []fwksched.Endpoint{podA})
-	expectScore(t, scores, podA, 1.0)
-
-	s.mu.Lock()
-	_, exists := s.sessions["s1"]
-	s.mu.Unlock()
-	if !exists {
-		t.Error("session entry must survive a growing conversation with estimate/usage scale mismatch")
-	}
-}
-
-func TestRolloverDisabled(t *testing.T) {
-	s, _ := newTestScorer(parameters{RolloverRatio: -1})
-	podA := newEndpoint("pod-a")
-	request := chatRequest("s1", 40000)
-
-	s.ResponseBody(context.Background(), request, endOfStreamResponse(9500, 500), podA.GetMetadata())
-
-	// Same shrunken prompt as the rollover test, but detection is disabled:
-	// full coverage of the small prompt.
-	scores := s.Score(context.Background(), chatRequest("s1", 8000), []fwksched.Endpoint{podA})
-	expectScore(t, scores, podA, 1.0)
+	expectScore(t, scores, podB, 1.0)
+	expectScore(t, scores, podC, 0.0)
 }
 
 func TestStreamingChunksIgnoredUntilEndOfStream(t *testing.T) {
@@ -253,8 +226,9 @@ func TestStreamingChunksIgnoredUntilEndOfStream(t *testing.T) {
 	chunk := &requestcontrol.Response{EndOfStream: false, Usage: fwkrh.Usage{PromptTokens: 5000}}
 	s.ResponseBody(context.Background(), request, chunk, podA.GetMetadata())
 
-	scores := s.Score(context.Background(), chatRequest("s1", 4000), []fwksched.Endpoint{podA})
-	expectScore(t, scores, podA, 0.0)
+	if _, ok := indexedCoverage(s, "s1", podA); ok {
+		t.Error("streaming chunk must not create an index entry")
+	}
 }
 
 func TestZeroUsageKeepsEstimate(t *testing.T) {
@@ -266,8 +240,9 @@ func TestZeroUsageKeepsEstimate(t *testing.T) {
 	// Stream finished without usage (no include_usage): estimate survives.
 	s.ResponseBody(context.Background(), request, endOfStreamResponse(0, 0), podA.GetMetadata())
 
-	scores := s.Score(context.Background(), chatRequest("s1", 4800), []fwksched.Endpoint{podA}) // 1201 tokens
-	expectScore(t, scores, podA, 1001.0/1201.0)
+	if c, ok := indexedCoverage(s, "s1", podA); !ok || c != 1001 {
+		t.Errorf("coverage = %d (exists=%v), want the 1001 estimate to survive", c, ok)
+	}
 }
 
 func TestSessionsExpire(t *testing.T) {
@@ -279,8 +254,9 @@ func TestSessionsExpire(t *testing.T) {
 	clock.advance(2 * time.Minute)
 	s.removeExpired()
 
-	scores := s.Score(context.Background(), chatRequest("s1", 4000), []fwksched.Endpoint{podA})
-	expectScore(t, scores, podA, 0.0)
+	if _, ok := indexedCoverage(s, "s1", podA); ok {
+		t.Error("session entry must expire past the TTL")
+	}
 }
 
 func TestScoreRefreshesLastSeen(t *testing.T) {
@@ -296,8 +272,9 @@ func TestScoreRefreshesLastSeen(t *testing.T) {
 	clock.advance(45 * time.Second)
 	s.removeExpired()
 
-	scores := s.Score(context.Background(), chatRequest("s1", 4000), []fwksched.Endpoint{podA})
-	expectScore(t, scores, podA, 1.0)
+	if _, ok := indexedCoverage(s, "s1", podA); !ok {
+		t.Error("scoring must refresh last-seen and keep the entry alive")
+	}
 }
 
 func TestCapacityEviction(t *testing.T) {
@@ -358,40 +335,40 @@ func TestDerivedSessionIDPrecedesAll(t *testing.T) {
 	}
 }
 
-func TestStructuralIdentitySkipsRollover(t *testing.T) {
-	// Chain-derived ids re-key rewritten histories by construction; a delta
-	// continuation's small prompt must not trip the shrink heuristic.
-	s, _ := newTestScorer(parameters{})
-	podA := newEndpoint("pod-a")
-
-	s.PreRequest(context.Background(), chatRequest("s1", 40000), schedulingResultFor(podA)) // est 10001
-
-	small := chatRequest("s1", 8000) // est 2001 < 0.5 * 10001
-	small.PutAttribute(attrsession.StructuralIdentityDataKey.String(), true)
-	scores := s.Score(context.Background(), small, []fwksched.Endpoint{podA})
-	expectScore(t, scores, podA, 1.0)
-
-	s.mu.Lock()
-	_, exists := s.sessions["s1"]
-	s.mu.Unlock()
-	if !exists {
-		t.Error("structural identity must suppress heuristic rollover")
-	}
-}
-
 func TestForkParentAttributeAdoption(t *testing.T) {
 	s, _ := newTestScorer(parameters{})
-	podA := newEndpoint("pod-a")
+	podA, podB := newEndpoint("pod-a"), newEndpoint("pod-b")
 
 	parent := chatRequest("parent", 4000)
 	s.PreRequest(context.Background(), parent, schedulingResultFor(podA))
 	s.ResponseBody(context.Background(), parent, endOfStreamResponse(1200, 100), podA.GetMetadata())
 
-	child := chatRequest("child", 4400)
-	child.PutAttribute(attrsession.ForkParentDataKey.String(), attrsession.SessionID("parent"))
-	scores := s.Score(context.Background(), child, []fwksched.Endpoint{podA})
-	if scores[podA] <= 0 {
+	child := forkChild("child", "parent", 4400)
+	scores := s.Score(context.Background(), child, []fwksched.Endpoint{podA, podB})
+	if scores[podA] <= scores[podB] {
 		t.Fatalf("fork-parent attribute must adopt the parent's coverage: %v", scores)
+	}
+}
+
+func TestForkDivergesWithoutTouchingParent(t *testing.T) {
+	s, _ := newTestScorer(parameters{})
+	podA, podB := newEndpoint("pod-a"), newEndpoint("pod-b")
+
+	parent := chatRequest("parent", 4000)
+	s.PreRequest(context.Background(), parent, schedulingResultFor(podA))
+	s.ResponseBody(context.Background(), parent, endOfStreamResponse(1200, 100), podA.GetMetadata())
+
+	// The fork adopts on first sight, then diverges on pod-b without
+	// touching the parent's entry.
+	fork := forkChild("fork-1", "parent", 4400)
+	s.Score(context.Background(), fork, []fwksched.Endpoint{podA, podB})
+	s.ResponseBody(context.Background(), fork, endOfStreamResponse(2000, 100), podB.GetMetadata())
+
+	if c, _ := indexedCoverage(s, "fork-1", podB); c != 2100 {
+		t.Errorf("fork coverage on pod-b = %d, want 2100", c)
+	}
+	if c, _ := indexedCoverage(s, "parent", podB); c != 0 {
+		t.Errorf("parent coverage on pod-b = %d, want 0 (fork diverges alone)", c)
 	}
 }
 
@@ -400,11 +377,7 @@ func TestResidencyMergesAsEngineTruth(t *testing.T) {
 	// response-fed coverage: a session unknown to the scorer's own index
 	// still scores warm on the pod the events say holds its KV.
 	s, _ := newTestScorer(parameters{})
-	podA := fwksched.NewEndpoint(
-		&fwkdl.EndpointMetadata{
-			NamespacedName: k8stypes.NamespacedName{Namespace: "ns", Name: "pod-a"},
-			Address:        "10.0.0.1", Port: "8000",
-		}, &fwkdl.Metrics{}, nil)
+	podA := newAddressedEndpoint("pod-a", "10.0.0.1")
 	podB := newEndpoint("pod-b")
 
 	request := chatRequest("s1", 4000) // estimate 1001, session unknown
@@ -412,7 +385,7 @@ func TestResidencyMergesAsEngineTruth(t *testing.T) {
 		[]attrsession.PodResidency{{Pod: "10.0.0.1:8000", Tier: "gpu", UpTo: "c3", Tokens: 900}})
 
 	scores := s.Score(context.Background(), request, []fwksched.Endpoint{podA, podB})
-	expectScore(t, scores, podA, 900.0/1001.0)
+	expectScore(t, scores, podA, 1.0)
 	expectScore(t, scores, podB, 0.0)
 }
 
@@ -421,16 +394,8 @@ func TestResidencyAuthoritativeReplacesBelief(t *testing.T) {
 	// Response-fed belief that pod-a is warm dies when residency says the
 	// session's KV survives only on pod-b (pod-a evicted it).
 	s, _ := newTestScorer(parameters{ResidencyAuthoritative: true})
-	podA := fwksched.NewEndpoint(
-		&fwkdl.EndpointMetadata{
-			NamespacedName: k8stypes.NamespacedName{Namespace: "ns", Name: "pod-a"},
-			Address:        "10.0.0.1", Port: "8000",
-		}, &fwkdl.Metrics{}, nil)
-	podB := fwksched.NewEndpoint(
-		&fwkdl.EndpointMetadata{
-			NamespacedName: k8stypes.NamespacedName{Namespace: "ns", Name: "pod-b"},
-			Address:        "10.0.0.2", Port: "8000",
-		}, &fwkdl.Metrics{}, nil)
+	podA := newAddressedEndpoint("pod-a", "10.0.0.1")
+	podB := newAddressedEndpoint("pod-b", "10.0.0.2")
 
 	// Response-fed belief: warm on pod-a.
 	warm := chatRequest("s1", 4000)
@@ -444,12 +409,13 @@ func TestResidencyAuthoritativeReplacesBelief(t *testing.T) {
 
 	scores := s.Score(context.Background(), resume, []fwksched.Endpoint{podA, podB})
 	expectScore(t, scores, podA, 0.0)
-	expectScore(t, scores, podB, 800.0/1001.0)
+	expectScore(t, scores, podB, 1.0)
 
 	// Without the attribute, response-fed belief still applies (fallback).
 	blind := chatRequest("s1", 4000)
 	scores = s.Score(context.Background(), blind, []fwksched.Endpoint{podA, podB})
 	expectScore(t, scores, podA, 1.0)
+	expectScore(t, scores, podB, 0.0)
 }
 
 func TestSacrificialPlacementSteersFreshTraffic(t *testing.T) {
@@ -457,16 +423,8 @@ func TestSacrificialPlacementSteersFreshTraffic(t *testing.T) {
 	// equal load, pod-a holds 50k of session KV, pod-b holds 2k — fresh
 	// one-shot requests go to pod-b. Session traffic is unaffected.
 	s, _ := newTestScorer(parameters{QueueWeight: 1, SacrificialWeight: 0.5})
-	podA := fwksched.NewEndpoint(
-		&fwkdl.EndpointMetadata{
-			NamespacedName: k8stypes.NamespacedName{Namespace: "ns", Name: "pod-a"},
-			Address:        "10.0.0.1", Port: "8000",
-		}, &fwkdl.Metrics{}, nil)
-	podB := fwksched.NewEndpoint(
-		&fwkdl.EndpointMetadata{
-			NamespacedName: k8stypes.NamespacedName{Namespace: "ns", Name: "pod-b"},
-			Address:        "10.0.0.2", Port: "8000",
-		}, &fwkdl.Metrics{}, nil)
+	podA := newAddressedEndpoint("pod-a", "10.0.0.1")
+	podB := newAddressedEndpoint("pod-b", "10.0.0.2")
 	mass := map[string]int{"10.0.0.1:8000": 50000, "10.0.0.2:8000": 2000}
 
 	fresh := chatRequest("one-shot", 4000)
@@ -515,140 +473,14 @@ func TestEstimatePromptTokens(t *testing.T) {
 	}
 }
 
-func withHeader(r *fwksched.InferenceRequest, name, value string) *fwksched.InferenceRequest {
-	r.Headers[name] = value
-	return r
-}
-
-func TestRootSharingAcrossSessions(t *testing.T) {
-	s, _ := newTestScorer(parameters{})
-	podA, podB := newEndpoint("pod-a"), newEndpoint("pod-b")
-
-	// Parent declares its prompt as root R and lands on pod-a.
-	parent := withHeader(chatRequest("parent", 48000), defaultShareAsHeaderName, "R")
-	s.PreRequest(context.Background(), parent, schedulingResultFor(podA))
-	s.ResponseBody(context.Background(), parent, endOfStreamResponse(12000, 50), podA.GetMetadata())
-
-	// A fresh session referencing R sees pod-a warm (full coverage of its
-	// prompt, clamped), pod-b cold.
-	child1 := withHeader(chatRequest("child-1", 47000), defaultRootHeaderName, "R")
-	scores := s.Score(context.Background(), child1, []fwksched.Endpoint{podA, podB})
-	expectScore(t, scores, podA, 1.0)
-	expectScore(t, scores, podB, 0.0)
-
-	// child-1 gets served on pod-b; its response warms the root there too
-	// (the root prefix is now resident on both endpoints — reuse is a forest).
-	s.ResponseBody(context.Background(), child1, endOfStreamResponse(12150, 40), podB.GetMetadata())
-	child2 := withHeader(chatRequest("child-2", 47000), defaultRootHeaderName, "R")
-	scores = s.Score(context.Background(), child2, []fwksched.Endpoint{podA, podB})
-	expectScore(t, scores, podA, 1.0)
-	expectScore(t, scores, podB, 1.0)
-}
-
-func TestRootReferenceToUnknownRootScoresZero(t *testing.T) {
-	s, _ := newTestScorer(parameters{})
-	podA := newEndpoint("pod-a")
-
-	child := withHeader(chatRequest("child", 4000), defaultRootHeaderName, "nope")
-	scores := s.Score(context.Background(), child, []fwksched.Endpoint{podA})
-	expectScore(t, scores, podA, 0.0)
-}
-
-func TestChildrenDoNotWarmRootAtScheduling(t *testing.T) {
-	s, _ := newTestScorer(parameters{})
-	podA, podC := newEndpoint("pod-a"), newEndpoint("pod-c")
-
-	parent := withHeader(chatRequest("parent", 48000), defaultShareAsHeaderName, "R")
-	s.PreRequest(context.Background(), parent, schedulingResultFor(podA))
-
-	// A child scheduled to pod-c must NOT mark the root warm there before its
-	// response exists — optimistic root warmth would herd a burst.
-	child := withHeader(chatRequest("child-1", 47000), defaultRootHeaderName, "R")
-	s.PreRequest(context.Background(), child, schedulingResultFor(podC))
-
-	probe := withHeader(chatRequest("child-2", 47000), defaultRootHeaderName, "R")
-	scores := s.Score(context.Background(), probe, []fwksched.Endpoint{podA, podC})
-	expectScore(t, scores, podA, 1.0) // parent's own optimistic placement
-	expectScore(t, scores, podC, 0.0) // child scheduling left no trace
-}
-
-func TestForkAdoptsParentCoverage(t *testing.T) {
-	s, _ := newTestScorer(parameters{})
-	podA, podB := newEndpoint("pod-a"), newEndpoint("pod-b")
-
-	parent := chatRequest("parent", 4000)
-	s.PreRequest(context.Background(), parent, schedulingResultFor(podA))
-	s.ResponseBody(context.Background(), parent, endOfStreamResponse(1200, 100), podA.GetMetadata())
-
-	// First sight of the fork: adopts the parent's coverage.
-	fork := withHeader(chatRequest("fork-1", 4400), defaultForkHeaderName, "parent")
-	scores := s.Score(context.Background(), fork, []fwksched.Endpoint{podA, podB})
-	if scores[podA] <= 0 {
-		t.Fatalf("fork should score the parent's endpoint, got %v", scores[podA])
-	}
-
-	// The fork then diverges on pod-b without touching the parent.
-	s.ResponseBody(context.Background(), fork, endOfStreamResponse(2000, 100), podB.GetMetadata())
-	parentScores := s.Score(context.Background(), chatRequest("parent", 4000), []fwksched.Endpoint{podA, podB})
-	expectScore(t, parentScores, podB, 0.0)
-}
-
-func TestForkWithSmallerPromptKeepsAdoptedCoverage(t *testing.T) {
-	// Regression: a sub-agent's first prompt (shared root + task) is routinely
-	// far below half the parent's full history. Inheriting the parent's prompt
-	// high-water made rollover treat the fork as a rewrite and delete the
-	// adopted entry on first scoring, permanently.
-	s, _ := newTestScorer(parameters{})
-	podA, podB := newEndpoint("pod-a"), newEndpoint("pod-b")
-
-	parent := chatRequest("parent", 40000) // estimate 10001
-	s.PreRequest(context.Background(), parent, schedulingResultFor(podA))
-	s.ResponseBody(context.Background(), parent, endOfStreamResponse(24000, 500), podA.GetMetadata())
-
-	// Fork estimate 3251 < 0.5 * 10001: adoption must survive, not roll over.
-	fork := withHeader(chatRequest("fork-1", 13000), defaultForkHeaderName, "parent")
-	scores := s.Score(context.Background(), fork, []fwksched.Endpoint{podA, podB})
-	expectScore(t, scores, podA, 1.0)
-	expectScore(t, scores, podB, 0.0)
-
-	s.mu.Lock()
-	_, exists := s.sessions["fork-1"]
-	s.mu.Unlock()
-	if !exists {
-		t.Error("fork entry must survive its first scoring")
-	}
-}
-
-func TestForkRolloverUsesOwnHistory(t *testing.T) {
-	// Rollover still protects the fork once its OWN prompt high-water exists.
-	s, _ := newTestScorer(parameters{})
-	podA := newEndpoint("pod-a")
-
-	parent := chatRequest("parent", 40000)
-	s.PreRequest(context.Background(), parent, schedulingResultFor(podA))
-
-	fork := withHeader(chatRequest("fork-1", 20000), defaultForkHeaderName, "parent") // est 5001
-	s.PreRequest(context.Background(), fork, schedulingResultFor(podA))
-
-	// The fork's history is rewritten: est 2001 < 0.5 * 5001.
-	scores := s.Score(context.Background(), chatRequest("fork-1", 8000), []fwksched.Endpoint{podA})
-	expectScore(t, scores, podA, 0.0)
-
-	s.mu.Lock()
-	_, exists := s.sessions["fork-1"]
-	s.mu.Unlock()
-	if exists {
-		t.Error("fork entry should be removed after its own rollover")
-	}
-}
-
-// costScenario builds a warm shared root on pod-a: the parent declared root R
-// (est 12001), completed, and left no in-flight work.
+// costScenario builds a completed 12k-token session on pod-a ("parent",
+// usage-fed coverage 12020, no in-flight work). Children fork it via the
+// chain-identity ForkParent attribute and adopt that coverage on first sight.
 func costScenario(t *testing.T) (*SessionCoverage, fwksched.Endpoint, fwksched.Endpoint) {
 	t.Helper()
 	s, _ := newTestScorer(parameters{QueueWeight: 1})
 	podA, podB := newEndpoint("pod-a"), newEndpoint("pod-b")
-	parent := withRequestID(withHeader(chatRequest("parent", 48000), defaultShareAsHeaderName, "R"), "req-parent")
+	parent := withRequestID(chatRequest("parent", 48000), "req-parent")
 	s.PreRequest(context.Background(), parent, schedulingResultFor(podA))
 	s.ResponseBody(context.Background(), parent, endOfStreamResponse(12000, 20), podA.GetMetadata())
 	return s, podA, podB
@@ -657,21 +489,20 @@ func costScenario(t *testing.T) (*SessionCoverage, fwksched.Endpoint, fwksched.E
 func TestCostBurstSpillsFromWarmEndpoint(t *testing.T) {
 	s, podA, podB := costScenario(t)
 
-	// Each stacked child occupies its admission gap (250) plus the decode
-	// allowance (750). A lightly-stacked warm pod keeps winning — reuse is
-	// worth more than the queue — until the stacked work outweighs a cold
-	// 12k prefill (threshold: 13 children).
+	// Each stacked fork occupies its admission gap (231) plus the decode
+	// allowance (750). The warm pod keeps winning — reuse is worth more than
+	// the queue — until the stacked work outweighs a cold 12.3k prefill
+	// (threshold: 13 children).
 	for i := 0; i < 13; i++ {
-		child := withRequestID(withHeader(chatRequest(fmt.Sprintf("child-%d", i), 49000), defaultRootHeaderName, "R"),
-			fmt.Sprintf("req-c%d", i))
+		child := withRequestID(forkChild(fmt.Sprintf("child-%d", i), "parent", 49000), fmt.Sprintf("req-c%d", i))
 		scores := s.Score(context.Background(), child, []fwksched.Endpoint{podA, podB})
-		if i < 3 && scores[podA] <= scores[podB] {
-			t.Fatalf("lightly-stacked warm pod must still win at child %d: %v", i, scores)
+		if scores[podA] <= scores[podB] {
+			t.Fatalf("stacked warm pod must still win at child %d: %v", i, scores)
 		}
 		s.PreRequest(context.Background(), child, schedulingResultFor(podA))
 	}
 
-	overflow := withRequestID(withHeader(chatRequest("child-13", 49000), defaultRootHeaderName, "R"), "req-c13")
+	overflow := withRequestID(forkChild("child-13", "parent", 49000), "req-c13")
 	scores := s.Score(context.Background(), overflow, []fwksched.Endpoint{podA, podB})
 	if scores[podB] <= scores[podA] {
 		t.Fatalf("burst must spill once stacked work outweighs the cold prefill: %v", scores)
@@ -681,12 +512,13 @@ func TestCostBurstSpillsFromWarmEndpoint(t *testing.T) {
 func TestCostStaggeredFollowsWarmEndpoint(t *testing.T) {
 	s, podA, podB := costScenario(t)
 
-	child1 := withRequestID(withHeader(chatRequest("child-1", 49000), defaultRootHeaderName, "R"), "req-c1")
+	child1 := withRequestID(forkChild("child-1", "parent", 49000), "req-c1")
+	s.Score(context.Background(), child1, []fwksched.Endpoint{podA, podB})
 	s.PreRequest(context.Background(), child1, schedulingResultFor(podA))
 	// child-1 completes before child-2 arrives (staggered arrivals).
 	s.ResponseBody(context.Background(), child1, endOfStreamResponse(12250, 20), podA.GetMetadata())
 
-	child2 := withRequestID(withHeader(chatRequest("child-2", 49000), defaultRootHeaderName, "R"), "req-c2")
+	child2 := withRequestID(forkChild("child-2", "parent", 49000), "req-c2")
 	scores := s.Score(context.Background(), child2, []fwksched.Endpoint{podA, podB})
 	if scores[podA] <= scores[podB] {
 		t.Fatalf("staggered arrivals must follow the warm pod: %v", scores)
@@ -727,102 +559,6 @@ func TestInFlightOrphansExpire(t *testing.T) {
 	scores := s.Score(context.Background(), chatRequest("s-new", 4000), []fwksched.Endpoint{podA, podB})
 	expectScore(t, scores, podA, 0.5)
 	expectScore(t, scores, podB, 0.5)
-}
-
-// dynamoRequest builds a chat request carrying the Dynamo
-// nvext.session_control dialect in its body payload instead of headers.
-func dynamoRequest(sid, action string, chars int) *fwksched.InferenceRequest {
-	r := chatRequest("", chars)
-	r.Body.Payload = fwkrh.PayloadMap(map[string]any{
-		"nvext": map[string]any{
-			"session_control": map[string]any{"session_id": sid, "action": action},
-		},
-	})
-	return r
-}
-
-func TestDynamoDialectCarriesSessionIdentity(t *testing.T) {
-	s, _ := newTestScorer(parameters{})
-	podA, podB := newEndpoint("pod-a"), newEndpoint("pod-b")
-
-	s.PreRequest(context.Background(), dynamoRequest("conv-1", "bind", 4000), schedulingResultFor(podA))
-
-	scores := s.Score(context.Background(), dynamoRequest("conv-1", "bind", 4800), []fwksched.Endpoint{podA, podB})
-	expectScore(t, scores, podA, 1001.0/1201.0)
-	expectScore(t, scores, podB, 0.0)
-}
-
-func TestDynamoCloseReleasesSession(t *testing.T) {
-	s, _ := newTestScorer(parameters{})
-	podA := newEndpoint("pod-a")
-
-	bindTurn := dynamoRequest("conv-1", "bind", 4000)
-	s.PreRequest(context.Background(), bindTurn, schedulingResultFor(podA))
-	s.ResponseBody(context.Background(), bindTurn, endOfStreamResponse(1200, 50), podA.GetMetadata())
-
-	// The final turn still routes with affinity, then releases the entry.
-	closeTurn := dynamoRequest("conv-1", "close", 4400)
-	scores := s.Score(context.Background(), closeTurn, []fwksched.Endpoint{podA})
-	if scores[podA] <= 0 {
-		t.Fatalf("final turn must still score its session's endpoint: %v", scores)
-	}
-	s.ResponseBody(context.Background(), closeTurn, endOfStreamResponse(1400, 50), podA.GetMetadata())
-
-	s.mu.Lock()
-	_, exists := s.sessions["conv-1"]
-	s.mu.Unlock()
-	if exists {
-		t.Error("close action must release the session entry")
-	}
-}
-
-func TestDynamoCloseReleasesWithoutUsage(t *testing.T) {
-	// Regression: a close on a stream without include_usage arrives with zero
-	// usage in the final chunk. The declaration ends the lineage, not the
-	// accounting — release must not sit behind the usage early-return.
-	s, _ := newTestScorer(parameters{})
-	podA := newEndpoint("pod-a")
-
-	bindTurn := dynamoRequest("conv-1", "bind", 4000)
-	s.PreRequest(context.Background(), bindTurn, schedulingResultFor(podA))
-
-	closeTurn := dynamoRequest("conv-1", "close", 4400)
-	s.ResponseBody(context.Background(), closeTurn, endOfStreamResponse(0, 0), podA.GetMetadata())
-
-	s.mu.Lock()
-	_, exists := s.sessions["conv-1"]
-	s.mu.Unlock()
-	if exists {
-		t.Error("close must release the session even when the response carries no usage")
-	}
-
-	// Same for a response with no resolved endpoint metadata.
-	s.PreRequest(context.Background(), bindTurn, schedulingResultFor(podA))
-	s.ResponseBody(context.Background(), dynamoRequest("conv-1", "close", 4400), endOfStreamResponse(1000, 50), nil)
-
-	s.mu.Lock()
-	_, exists = s.sessions["conv-1"]
-	s.mu.Unlock()
-	if exists {
-		t.Error("close must release the session even without endpoint metadata")
-	}
-}
-
-func TestHeaderPrecedesDynamoDialect(t *testing.T) {
-	s, _ := newTestScorer(parameters{})
-	podA := newEndpoint("pod-a")
-
-	r := dynamoRequest("nvext-id", "bind", 4000)
-	r.Headers[defaultHeaderName] = "header-id"
-	s.PreRequest(context.Background(), r, schedulingResultFor(podA))
-
-	s.mu.Lock()
-	_, headerExists := s.sessions["header-id"]
-	_, nvextExists := s.sessions["nvext-id"]
-	s.mu.Unlock()
-	if !headerExists || nvextExists {
-		t.Errorf("header must take precedence: header=%v nvext=%v", headerExists, nvextExists)
-	}
 }
 
 func TestFactoryDefaults(t *testing.T) {

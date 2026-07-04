@@ -18,7 +18,6 @@ package chainidentity_test
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 	"testing"
 
@@ -327,7 +326,7 @@ func TestCompletionsTinyPromptNoIdentity(t *testing.T) {
 
 func newScorer(t *testing.T) *sessioncoverage.SessionCoverage {
 	t.Helper()
-	pl, err := sessioncoverage.Factory("test", json.NewDecoder(strings.NewReader(`{"queueWeight": -1}`)), nil)
+	pl, err := sessioncoverage.Factory("test", nil, nil)
 	if err != nil {
 		t.Fatalf("scorer factory: %v", err)
 	}
@@ -396,14 +395,14 @@ func TestUndeclaredForkRoutesToParentEndpoint(t *testing.T) {
 	}
 }
 
-func TestDeltaContinuationDoesNotRollover(t *testing.T) {
-	// A delta turn's prompt estimate is far below the lineage's high-water.
-	// The structural marker must keep the scorer's shrink heuristic from
-	// deleting the lineage entry.
+func TestDeltaContinuationFollowsCoveredEndpoint(t *testing.T) {
+	// A delta turn carries no prefix to rehash; the declared id aliases it to
+	// the lineage, and the scorer keeps it on the covered endpoint even
+	// though its prompt estimate is far below the lineage's coverage.
 	ctx := context.Background()
 	p := newProducer("")
 	s := newScorer(t)
-	podA := newEndpoint("pod-a")
+	podA, podB := newEndpoint("pod-a"), newEndpoint("pod-b")
 
 	t1 := chatReq("m", [2]string{"system", strings.Repeat("s", 20000)}, [2]string{"user", "u1"})
 	t1.Headers["x-session-id"] = "conv-1"
@@ -418,8 +417,8 @@ func TestDeltaContinuationDoesNotRollover(t *testing.T) {
 		t.Fatal("delta must resolve to the same lineage")
 	}
 
-	scores := s.Score(ctx, delta, []fwksched.Endpoint{podA})
-	if scores[podA] != 1.0 {
-		t.Fatalf("delta turn must stay on the covered endpoint without rollover: %v", scores)
+	scores := s.Score(ctx, delta, []fwksched.Endpoint{podA, podB})
+	if scores[podA] <= scores[podB] {
+		t.Fatalf("delta turn must stay on the covered endpoint: %v", scores)
 	}
 }
