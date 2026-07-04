@@ -108,6 +108,12 @@ type Parameters struct {
 	// RetainPriority is the eviction priority (0-100) used with
 	// RetainTTLSeconds. Defaults to 80.
 	RetainPriority int `json:"retainPriority"`
+	// RetainDeclaredSessions extends retention to FRESH lineages that carry
+	// a declared client session id (header or in-band bind): an explicit
+	// declaration is orchestrator intent, so the session is protected from
+	// its first turn instead of from its first continuation. Anonymous
+	// one-shot traffic remains unretained. Default false.
+	RetainDeclaredSessions bool `json:"retainDeclaredSessions"`
 }
 
 var _ requestcontrol.DataProducer = &Producer{}
@@ -123,6 +129,7 @@ type Producer struct {
 	headerName     string
 	retainTTL      int
 	retainPriority int
+	retainDeclared bool
 	index          *lineageIndex
 }
 
@@ -173,6 +180,7 @@ func New(ctx context.Context, name string, params Parameters) *Producer {
 		headerName:     headerName,
 		retainTTL:      params.RetainTTLSeconds,
 		retainPriority: retainPriority,
+		retainDeclared: params.RetainDeclaredSessions,
 		index:          newLineageIndex(ttl, maxLineages),
 	}
 	if ctx != nil {
@@ -207,7 +215,8 @@ func (p *Producer) Produce(_ context.Context, request *fwksched.InferenceRequest
 		return nil
 	}
 	chain := p.chain(request, blocks)
-	res := p.index.resolve(chain, p.declaredID(request))
+	declared := p.declaredID(request)
+	res := p.index.resolve(chain, declared)
 	if res.LineageID == "" {
 		return nil
 	}
@@ -225,7 +234,7 @@ func (p *Producer) Produce(_ context.Context, request *fwksched.InferenceRequest
 	// prompt against eviction for the pause window (ttl-bounded bias, never
 	// a pin). One-shot traffic gets nothing — under memory pressure it takes
 	// the eviction hit instead of the paused sessions.
-	if p.retainTTL > 0 && res.Continued {
+	if p.retainTTL > 0 && (res.Continued || (p.retainDeclared && declared != "")) {
 		stampRetention(request, res.LineageID, p.retainPriority, p.retainTTL)
 	}
 	return nil
