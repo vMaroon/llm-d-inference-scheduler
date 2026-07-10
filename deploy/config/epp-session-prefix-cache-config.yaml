@@ -1,0 +1,29 @@
+# Sample EPP configuration for session-granularity prefix-cache affinity:
+# the session-prefix-cache-producer derives session identity from request
+# content and feeds the generic prefix-cache-scorer, composed with the
+# standard queue and kv-cache utilization scorers. Works against stock
+# engines; no tokenizer or KV-events required.
+#
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- type: single-profile-handler
+- type: decode-filter
+- type: session-prefix-cache-producer
+- type: prefix-cache-scorer
+  parameters:
+    prefixMatchInfoProducerName: session-prefix-cache-producer
+- type: queue-scorer
+- type: kv-cache-utilization-scorer
+- type: max-score-picker
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: decode-filter
+  - pluginRef: prefix-cache-scorer
+    weight: 3.0
+  - pluginRef: queue-scorer
+    weight: 2.0
+  - pluginRef: kv-cache-utilization-scorer
+    weight: 2.0
+  - pluginRef: max-score-picker

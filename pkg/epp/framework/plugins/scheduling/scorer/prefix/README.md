@@ -35,7 +35,7 @@ The squaring of `matchLengthScore` introduces a non-linearity motivated by the f
 
 - `PrefixCacheMatchInfo`
 
-The attribute is typically produced by the approximate prefix cache data producer before scheduling.
+The attribute is produced before scheduling by one of the prefix data producers: `approx-prefix-cache-producer` (the default), `precise-prefix-cache-producer`, or `session-prefix-cache-producer`.
 
 ## Configuration
 
@@ -43,6 +43,7 @@ The attribute is typically produced by the approximate prefix cache data produce
 | :--- | :--- | :--- | :--- |
 | `matchLengthWeight` | float | Weight of the absolute match length in the score. Must be between `0.0` and `1.0`. | `0.0` |
 | `matchLengthScaleTokens` | integer | The number of tokens used to normalize `matchLengthScore`. | `8192` |
+| `prefixMatchInfoProducerName` | string | Name of the data producer instance whose `PrefixCacheMatchInfo` this scorer reads. | approximate producer |
 
 ### Example
 

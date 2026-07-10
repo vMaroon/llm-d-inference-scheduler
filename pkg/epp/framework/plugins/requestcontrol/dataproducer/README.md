@@ -18,6 +18,7 @@ Producers may also implement additional lifecycle hooks:
 | `approx-prefix-cache-producer` | [`approximateprefix`](approximateprefix/) | `PrefixCacheMatchInfo` | Hashes the prompt into blocks and matches against a per-pod LRU index for approximate prefix-cache affinity. |
 | `precise-prefix-cache-producer` | [`preciseprefixcache`](preciseprefixcache/) | `PrefixCacheMatchInfo` | Maintains a precise KV-block index by subscribing to vLLM KV-events; requires `token-producer` upstream. |
 | `burst-prefix-cache-producer` | [`burstprefix`](burstprefix/) | `PrefixCacheMatchInfo` | Batches requests within a time window and co-locates prompt-sharing samples (e.g. RL rollout groups) onto shared replicas; requires `token-producer` upstream. |
+| `session-prefix-cache-producer` | [`sessionprefix`](sessionprefix/) | `PrefixCacheMatchInfo` | Derives session identity from content chain-hashes and matches against an estimate-seeded session index for session-granularity prefix-cache affinity; no tokenizer or KV-events required. |
 | `inflight-load-producer` | [`inflightload`](inflightload/) | `InFlightLoad` | Tracks real-time in-flight request and token counts per endpoint across the full request lifecycle. |
 | `predicted-latency-producer` | [`predictedlatency`](predictedlatency/) | `LatencyPredictionInfo` | Trains XGBoost models via a sidecar and generates per-endpoint TTFT/TPOT predictions. |
 | `session-id-producer` | [`sessionid`](sessionid/) | `SessionID` | Extracts a session identifier from a request header or cookie and publishes it for affinity-aware plugins. |
@@ -40,6 +41,7 @@ The framework resolves a DAG from each plugin's `Produces` and `Consumes` declar
 - [Approximate Prefix Cache Producer](approximateprefix/README.md)
 - [Precise Prefix Cache Producer](preciseprefixcache/README.md)
 - [Burst Prefix Cache Producer](burstprefix/README.md)
+- [Session Prefix Cache Producer](sessionprefix/README.md)
 - [Token Producer](tokenizer/README.md)
 - [In-Flight Load Producer](inflightload/README.md)
 - [Predicted Latency Producer](predictedlatency/README.md)
