@@ -51,6 +51,11 @@ type PrefixCacheMatchInfo struct {
 	// per tier. Speculative index entries count under SpeculativeTierKey.
 	// Nil when the producer supplies no tier data.
 	cachedBlocksByTier map[string]int
+	// globalDPRank is the global data-parallel rank of the engine behind this
+	// endpoint, when the producer resolves one from rank-annotated KV events.
+	// hasGlobalDPRank distinguishes rank 0 from "no rank known".
+	globalDPRank    int
+	hasGlobalDPRank bool
 }
 
 func NewPrefixCacheMatchInfo(matchBlocks int, totalBlocks int, blockSizeTokens int) *PrefixCacheMatchInfo {
@@ -102,6 +107,20 @@ func (p *PrefixCacheMatchInfo) CachedBlocksByTier() map[string]int {
 	return p.cachedBlocksByTier
 }
 
+// WithGlobalDPRank sets the endpoint engine's global data-parallel rank and
+// returns the receiver for chaining.
+func (p *PrefixCacheMatchInfo) WithGlobalDPRank(rank int) *PrefixCacheMatchInfo {
+	p.globalDPRank = rank
+	p.hasGlobalDPRank = true
+	return p
+}
+
+// GlobalDPRank returns the endpoint engine's global data-parallel rank and
+// whether the producer resolved one.
+func (p *PrefixCacheMatchInfo) GlobalDPRank() (int, bool) {
+	return p.globalDPRank, p.hasGlobalDPRank
+}
+
 func (p *PrefixCacheMatchInfo) Clone() fwkdl.Cloneable {
 	return &PrefixCacheMatchInfo{
 		matchBlocks:        p.matchBlocks,
@@ -109,5 +128,7 @@ func (p *PrefixCacheMatchInfo) Clone() fwkdl.Cloneable {
 		blockSizeTokens:    p.blockSizeTokens,
 		cachedBlockCount:   p.cachedBlockCount,
 		cachedBlocksByTier: maps.Clone(p.cachedBlocksByTier),
+		globalDPRank:       p.globalDPRank,
+		hasGlobalDPRank:    p.hasGlobalDPRank,
 	}
 }

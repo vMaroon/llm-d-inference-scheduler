@@ -24,6 +24,13 @@ const (
 	// instead of recomputing them
 	KVCacheSourceHeader = "x-kv-cache-source-host-port"
 
+	// KVCacheSourceP2PPortHeader is the header name used to indicate the P2P
+	// connector port to pull from on the KVCacheSourceHeader worker. Under data
+	// parallelism each rank's P2P tier binds its own port (base + GLOBAL rank),
+	// so the pull must target the emitting rank's port rather than a
+	// deployment-wide flag value
+	KVCacheSourceP2PPortHeader = "x-kv-cache-source-p2p-port"
+
 	// InferencePoolAPIGroup is the default InferencePool API group
 	InferencePoolAPIGroup = "inference.networking.k8s.io"
 

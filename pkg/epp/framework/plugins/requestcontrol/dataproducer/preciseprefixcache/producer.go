@@ -79,6 +79,13 @@ type subscriberManager interface {
 	Shutdown(ctx context.Context)
 }
 
+// dpRankSource is the subset of kvevents.Pool the producer uses to annotate
+// each endpoint's PrefixCacheMatchInfo with the global data-parallel rank of
+// the engine behind it, narrowed so tests can substitute a fake.
+type dpRankSource interface {
+	GlobalDPRank(podIdentifier string) (int, bool)
+}
+
 // Producer is a DataProducer plugin that maintains a KV-block prefix-cache
 // index by subscribing to vLLM KV-events and writes per-endpoint
 // PrefixCacheMatchInfo for each request. Operators pair it with the
@@ -93,6 +100,11 @@ type Producer struct {
 
 	subscribersManager subscriberManager
 	kvEventsConfig     *kvevents.Config
+
+	// dpRanks resolves an endpoint address to the global data-parallel rank
+	// the KV-events pool learned for it (rank-granular identity mode); nil
+	// disables the annotation.
+	dpRanks dpRankSource
 
 	kvBlockScorer kvcache.KVBlockScorer
 
@@ -200,6 +212,7 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		kvBlockScorer:      kvBlockScorer,
 		subscribersManager: subscribersManager,
 		kvEventsConfig:     config.KVEventsConfig,
+		dpRanks:            pool,
 		dk:                 attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(name),
 		pluginState:        plugin.NewPluginState(ctx),
 		speculativeCache:   speculativeCache,
@@ -381,10 +394,15 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 				cachedBlocksByTier[tier] += count
 			}
 		}
-		ep.Put(p.dk.String(),
-			attrprefix.NewPrefixCacheMatchInfo(matchLen, totalBlocks, p.blockSizeTokens).
-				WithCachedBlockCount(cachedBlocks).
-				WithCachedBlocksByTier(cachedBlocksByTier))
+		info := attrprefix.NewPrefixCacheMatchInfo(matchLen, totalBlocks, p.blockSizeTokens).
+			WithCachedBlockCount(cachedBlocks).
+			WithCachedBlocksByTier(cachedBlocksByTier)
+		if p.dpRanks != nil {
+			if rank, ok := p.dpRanks.GlobalDPRank(addr); ok {
+				info = info.WithGlobalDPRank(rank)
+			}
+		}
+		ep.Put(p.dk.String(), info)
 	}
 
 	if p.speculativeEnabled {

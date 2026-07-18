@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strconv"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -61,6 +62,13 @@ type Config struct {
 	// the disagg-profile-handler's profiles.prefill. Empty defaults to
 	// "prefill".
 	PrefillProfileName string `json:"prefillProfileName,omitempty"`
+	// P2PPortBase is the base port of the engines' OffloadingConnector P2P
+	// tier; each data-parallel rank binds P2PPortBase + its GLOBAL rank. When
+	// > 0 and the best peer's global rank is known, PreRequest also sets
+	// routing.KVCacheSourceP2PPortHeader to the source rank's P2P port so the
+	// sidecar pulls from the exact rank holding the blocks. 0 disables the
+	// header (the sidecar falls back to its --p2p-connector-port flag).
+	P2PPortBase int `json:"p2pPortBase,omitempty"`
 }
 
 // compile-time type assertions
@@ -79,6 +87,7 @@ type Producer struct {
 	prefixMatchDataKey  plugin.DataKey
 	minCachedTokenDelta int
 	prefillProfile      string
+	p2pPortBase         int
 	attrKeyValue        string
 }
 
@@ -93,6 +102,9 @@ func PluginFactory(name string, rawParameters *json.Decoder, _ plugin.Handle) (p
 	}
 	if cfg.MinCachedTokenDelta < 1 {
 		return nil, fmt.Errorf("%s: minCachedTokenDelta must be >= 1, got %d", PluginType, cfg.MinCachedTokenDelta)
+	}
+	if cfg.P2PPortBase < 0 {
+		return nil, fmt.Errorf("%s: p2pPortBase must be >= 0, got %d", PluginType, cfg.P2PPortBase)
 	}
 	return New(name, cfg), nil
 }
@@ -109,6 +121,7 @@ func New(name string, cfg Config) *Producer {
 		prefixMatchDataKey:  attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(cfg.PrefixMatchInfoProducerName),
 		minCachedTokenDelta: cfg.MinCachedTokenDelta,
 		prefillProfile:      prefillProfile,
+		p2pPortBase:         cfg.P2PPortBase,
 		attrKeyValue:        fmt.Sprintf("%s/%s/best-match", PluginType, name),
 	}
 }
@@ -130,10 +143,14 @@ func (p *Producer) Consumes() plugin.DataDependencies {
 
 // bestMatchPeer is the candidate endpoint holding the most cached prompt
 // tokens for the request, stashed as a request attribute so PreRequest can
-// compare it against the scheduled endpoint.
+// compare it against the scheduled endpoint. globalDPRank carries the peer
+// engine's global data-parallel rank when its PrefixCacheMatchInfo resolves
+// one; hasGlobalDPRank distinguishes rank 0 from "no rank known".
 type bestMatchPeer struct {
-	hostPort     string
-	cachedTokens int
+	hostPort        string
+	cachedTokens    int
+	globalDPRank    int
+	hasGlobalDPRank bool
 }
 
 // attrKey returns the request-attribute key carrying the best-match peer,
@@ -157,6 +174,9 @@ func (p *Producer) Produce(ctx context.Context, request *scheduling.InferenceReq
 				hostPort:     net.JoinHostPort(md.Address, md.Port),
 				cachedTokens: cached,
 			}
+			if info := p.matchInfo(ep); info != nil {
+				best.globalDPRank, best.hasGlobalDPRank = info.GlobalDPRank()
+			}
 		}
 	}
 	if best.cachedTokens > 0 {
@@ -170,10 +190,14 @@ func (p *Producer) Produce(ctx context.Context, request *scheduling.InferenceReq
 
 // PreRequest sets routing.KVCacheSourceHeader to the best-match peer stashed
 // by Produce when it out-caches the pod computing the prefix by at least
-// minCachedTokenDelta tokens. Any inbound value of the header is removed.
+// minCachedTokenDelta tokens. With p2pPortBase configured and the peer's
+// global data-parallel rank known, routing.KVCacheSourceP2PPortHeader
+// additionally carries the peer rank's P2P tier port
+// (p2pPortBase + GLOBAL rank). Any inbound values of both headers are removed.
 func (p *Producer) PreRequest(ctx context.Context, request *scheduling.InferenceRequest, schedulingResult *scheduling.SchedulingResult) {
 	logger := log.FromContext(ctx).WithName(p.typedName.String()).V(logging.TRACE)
 	delete(request.Headers, routing.KVCacheSourceHeader)
+	delete(request.Headers, routing.KVCacheSourceP2PPortHeader)
 
 	best, ok := scheduling.ReadRequestAttribute[*bestMatchPeer](request, p.attrKey())
 	if !ok {
@@ -212,19 +236,36 @@ func (p *Producer) PreRequest(ctx context.Context, request *scheduling.Inference
 		request.Headers = map[string]string{}
 	}
 	request.Headers[routing.KVCacheSourceHeader] = best.hostPort
-	logger.Info("set KV cache source header", "requestID", request.RequestID, "value", best.hostPort)
+	// Each rank's P2P tier binds p2pPortBase + GLOBAL rank; without a known
+	// rank the header is omitted and the sidecar falls back to its
+	// --p2p-connector-port flag.
+	if p.p2pPortBase > 0 && best.hasGlobalDPRank {
+		request.Headers[routing.KVCacheSourceP2PPortHeader] = strconv.Itoa(p.p2pPortBase + best.globalDPRank)
+	}
+	logger.Info("set KV cache source header", "requestID", request.RequestID, "value", best.hostPort,
+		"p2pPort", request.Headers[routing.KVCacheSourceP2PPortHeader])
+}
+
+// matchInfo returns the endpoint's PrefixCacheMatchInfo from the configured
+// producer, or nil when absent.
+func (p *Producer) matchInfo(ep scheduling.Endpoint) *attrprefix.PrefixCacheMatchInfo {
+	raw, ok := ep.Get(p.prefixMatchDataKey.String())
+	if !ok {
+		return nil
+	}
+	info, ok := raw.(*attrprefix.PrefixCacheMatchInfo)
+	if !ok {
+		return nil
+	}
+	return info
 }
 
 // cachedTokenCount returns the endpoint's cached prompt tokens (unweighted
 // cached-block count times the block size) from its PrefixCacheMatchInfo,
 // or 0 when absent.
 func (p *Producer) cachedTokenCount(ep scheduling.Endpoint) int {
-	raw, ok := ep.Get(p.prefixMatchDataKey.String())
-	if !ok {
-		return 0
-	}
-	info, ok := raw.(*attrprefix.PrefixCacheMatchInfo)
-	if !ok {
+	info := p.matchInfo(ep)
+	if info == nil {
 		return 0
 	}
 	return info.CachedBlockCount() * info.BlockSizeTokens()
