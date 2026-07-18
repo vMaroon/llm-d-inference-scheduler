@@ -19,6 +19,7 @@ package proxy
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +36,12 @@ import (
 type contextKey string
 
 const requestStartTimeKey contextKey = "request_start_time"
+
+// kvCacheSourceP2PPortKey carries the validated value of
+// routing.KVCacheSourceP2PPortHeader through the request context, so the
+// connector paths that build a cached-prefix pull resolve the source rank's
+// P2P port without widening the pdConnectorHandler contract.
+const kvCacheSourceP2PPortKey contextKey = "kv_cache_source_p2p_port"
 
 const (
 	// ChatCompletionsPath is the OpenAI chat completions path
@@ -151,6 +158,24 @@ func (s *Server) disaggregatedPrefillHandler(apiType APIType) http.HandlerFunc {
 		}
 		if kvCacheSource != "" {
 			span.SetAttributes(attribute.String("llm_d.pd_proxy.kv_cache_source", kvCacheSource))
+		}
+
+		// The source's per-rank P2P tier port; a valid value overrides the
+		// --p2p-connector-port flag for this request's cached-prefix pull.
+		kvCacheSourceP2PPort := 0
+		if rawPort := strings.TrimSpace(r.Header.Get(routing.KVCacheSourceP2PPortHeader)); rawPort != "" {
+			if port, err := strconv.Atoi(rawPort); err == nil && port >= 1 && port <= 65535 {
+				kvCacheSourceP2PPort = port
+			} else {
+				s.logger.Info("ignoring malformed KV cache source p2p port header, falling back to --p2p-connector-port",
+					"value", rawPort)
+			}
+		}
+		r.Header.Del(routing.KVCacheSourceP2PPortHeader)
+		if kvCacheSource != "" && kvCacheSourceP2PPort > 0 {
+			ctx = context.WithValue(ctx, kvCacheSourceP2PPortKey, kvCacheSourceP2PPort)
+			r = r.WithContext(ctx)
+			span.SetAttributes(attribute.Int("llm_d.pd_proxy.kv_cache_source_p2p_port", kvCacheSourceP2PPort))
 		}
 
 		encoderHostPorts := r.Header.Values(routing.EncoderEndpointsHeader)

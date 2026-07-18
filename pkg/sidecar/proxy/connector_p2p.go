@@ -72,7 +72,7 @@ func (s *Server) handleP2P(w http.ResponseWriter, r *http.Request, prefillPodHos
 			requestFieldKVRequestID: kvRequestID,
 		},
 	}
-	s.addP2PPullToPrefill(prefillKVParams, kvCacheSource, prefillPodHostPort)
+	s.addP2PPullToPrefill(r.Context(), prefillKVParams, kvCacheSource, prefillPodHostPort)
 	prefillData[requestFieldKVTransferParams] = prefillKVParams
 	prefillData[requestFieldStream] = false
 	delete(prefillData, requestFieldStreamOptions)
@@ -223,6 +223,17 @@ func (s *Server) p2pPullAvailable() bool {
 		(s.config.EnableP2PPull && s.config.KVConnector == KVConnectorNIXLV2)
 }
 
+// p2pPullPort returns the port of the KV cache source's OffloadingConnector
+// P2P tier: the per-request value carried by routing.KVCacheSourceP2PPortHeader
+// when the request supplied a valid one (each data-parallel rank binds its own
+// port), otherwise the --p2p-connector-port flag.
+func (s *Server) p2pPullPort(ctx context.Context) int {
+	if port, ok := ctx.Value(kvCacheSourceP2PPortKey).(int); ok && port > 0 {
+		return port
+	}
+	return s.config.P2PConnectorPort
+}
+
 // addP2PPullToPrefill adds the OffloadingConnector p2p pull block to a prefill
 // leg's kv_transfer_params so the prefiller pulls cached prefix from
 // kvCacheSource while keeping its own computed blocks available for the
@@ -230,20 +241,21 @@ func (s *Server) p2pPullAvailable() bool {
 // prefiller itself, since there is nothing to pull from oneself. The p2p key
 // composes with NIXL params: vLLM's MultiConnector routes it to the
 // OffloadingConnector and the NIXL fields to the NixlConnector.
-func (s *Server) addP2PPullToPrefill(prefillKVParams map[string]any, kvCacheSource, prefillPodHostPort string) {
+func (s *Server) addP2PPullToPrefill(ctx context.Context, prefillKVParams map[string]any, kvCacheSource, prefillPodHostPort string) {
 	if kvCacheSource != "" && extractHost(kvCacheSource) != extractHost(prefillPodHostPort) {
-		prefillKVParams[requestFieldP2PParams] = s.p2pSourceParams(kvCacheSource)
+		prefillKVParams[requestFieldP2PParams] = s.p2pSourceParams(ctx, kvCacheSource)
 	}
 }
 
 // p2pSourceParams builds the kv_transfer_params.p2p block for a pull from
-// sourceHostPort's OffloadingConnector P2P tier. The kv_request_id is its
-// own fresh UUID: in P2P mode it is consumer-side only.
-func (s *Server) p2pSourceParams(sourceHostPort string) map[string]any {
+// sourceHostPort's OffloadingConnector P2P tier at the p2pPullPort resolved
+// from ctx. The kv_request_id is its own fresh UUID: in P2P mode it is
+// consumer-side only.
+func (s *Server) p2pSourceParams(ctx context.Context, sourceHostPort string) map[string]any {
 	return map[string]any{
 		requestFieldKVRequestID: newUUID(),
 		requestFieldRemoteHost:  extractHost(sourceHostPort),
-		requestFieldRemotePort:  s.config.P2PConnectorPort,
+		requestFieldRemotePort:  s.p2pPullPort(ctx),
 	}
 }
 
@@ -267,7 +279,7 @@ func (s *Server) decodeWithP2PSource(w http.ResponseWriter, r *http.Request, sou
 		return
 	}
 
-	p2pParams := s.p2pSourceParams(sourceHostPort)
+	p2pParams := s.p2pSourceParams(r.Context(), sourceHostPort)
 	// Rebuild kv_transfer_params from scratch: the sidecar owns this field, so
 	// client-supplied keys are dropped rather than forwarded to vLLM.
 	requestData[requestFieldKVTransferParams] = map[string]any{requestFieldP2PParams: p2pParams}
@@ -275,7 +287,7 @@ func (s *Server) decodeWithP2PSource(w http.ResponseWriter, r *http.Request, sou
 	s.logger.Info("running P2P source protocol",
 		"source_host", extractHost(sourceHostPort),
 		"kv_request_id", p2pParams[requestFieldKVRequestID],
-		"p2p_connector_port", s.config.P2PConnectorPort)
+		"p2p_connector_port", p2pParams[requestFieldRemotePort])
 
 	newBody, err := json.Marshal(requestData)
 	if err != nil {

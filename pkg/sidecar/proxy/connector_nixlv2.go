@@ -169,7 +169,7 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	}
 
 	// Compose the OffloadingConnector p2p pull onto the NIXL prefill leg.
-	s.addP2PPullToPrefill(completionRequest[requestFieldKVTransferParams].(map[string]any), kvCacheSource, prefillPodHostPort)
+	s.addP2PPullToPrefill(r.Context(), completionRequest[requestFieldKVTransferParams].(map[string]any), kvCacheSource, prefillPodHostPort)
 
 	completionRequest[requestFieldStream] = false
 	delete(completionRequest, requestFieldStreamOptions)
@@ -496,7 +496,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 		}
 	}
 	// Compose the OffloadingConnector p2p pull onto the NIXL prefill leg.
-	s.addP2PPullToPrefill(completionRequest[requestFieldKVTransferParams].(map[string]any), kvCacheSource, prefillPodHostPort)
+	s.addP2PPullToPrefill(r.Context(), completionRequest[requestFieldKVTransferParams].(map[string]any), kvCacheSource, prefillPodHostPort)
 
 	completionRequest[requestFieldStream] = false
 	delete(completionRequest, requestFieldStreamOptions)
