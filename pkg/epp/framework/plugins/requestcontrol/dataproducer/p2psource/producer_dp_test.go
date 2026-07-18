@@ -142,10 +142,10 @@ func TestPreRequest_SelfMatch_NoP2PPortHeader(t *testing.T) {
 
 	req := &scheduling.InferenceRequest{RequestID: "req-dp-self", Headers: map[string]string{}}
 	require.NoError(t, p.Produce(ctx, req, []scheduling.Endpoint{
-		dpEndpoint(p, "pod-a", "10.0.0.1", 2, 11),
+		dpEndpoint(p, "pod-a", "10.0.0.1", 2, 0),
 	}))
 
-	p.PreRequest(ctx, req, decodeOnly(dpEndpoint(p, "pod-a", "10.0.0.1", 2, 11)))
+	p.PreRequest(ctx, req, decodeOnly(dpEndpoint(p, "pod-a", "10.0.0.1", 2, 0)))
 
 	assert.NotContains(t, req.Headers, routing.KVCacheSourceHeader)
 	assert.NotContains(t, req.Headers, routing.KVCacheSourceP2PPortHeader)
