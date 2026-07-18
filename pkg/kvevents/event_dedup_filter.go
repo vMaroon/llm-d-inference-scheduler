@@ -25,19 +25,16 @@ import "sync"
 // genuine group.
 const noGroupIdx = -1
 
-// noDataParallelRank is the sentinel data-parallel rank used in a dedup scope.
-//
-// On current main the index identity (kvblock.PodEntry) is pod-level and does
-// NOT distinguish data-parallel ranks, so every scope uses this sentinel and
-// reference counts aggregate across ranks — which is exactly what the pod-level
-// index requires (a block is still resident on the pod until every rank has
-// removed it). The value matches PR #370's NoDataParallelRank (-1) convention.
-//
-// TODO(#370): once DataParallelRank is propagated onto EventBatch and into
-// PodEntry, source the rank from the event in pool.go so the dedup scope
-// becomes DP-aware in lockstep with the (then DP-aware) index identity. No
-// change to this file is required — only the scope construction at the call
-// sites.
+// noDataParallelRank is the sentinel data-parallel rank used in a dedup scope
+// when a batch is processed under pod-granular identity (no ServingPortBase
+// configured, or no rank annotation on the batch). Under that identity the
+// index does not distinguish data-parallel ranks, so reference counts
+// aggregate across ranks — a block is still resident on the pod until every
+// rank has removed it. When ServingPortBase keys identifiers per rank, the
+// scope carries the batch's real global rank instead (see
+// Pool.dataParallelIdentity), so two ranks' identical block hashes are
+// counted independently. The value matches PR #370's NoDataParallelRank (-1)
+// convention.
 const noDataParallelRank = -1
 
 // groupIdxOrNoGroup maps an optional event group index to the dedup-scope int,
@@ -52,8 +49,8 @@ func groupIdxOrNoGroup(groupIdx *int) int {
 // blockScope identifies the set of block reference counts that share a single
 // index eviction identity for one pod. Its fields mirror the dimensions of
 // kvblock.PodEntry that determine which stored entry an eviction targets: pod,
-// device tier, KV-cache group, and (in future, see noDataParallelRank)
-// data-parallel rank.
+// device tier, KV-cache group, and data-parallel rank (the
+// noDataParallelRank sentinel under pod-granular identity).
 type blockScope struct {
 	podIdentifier    string
 	deviceTier       string

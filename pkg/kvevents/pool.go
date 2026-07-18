@@ -18,6 +18,8 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"net"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -63,6 +65,19 @@ type Config struct {
 	// PodDiscoveryConfig holds the configuration for pod discovery.
 	// Only used when DiscoverPods is true.
 	PodDiscoveryConfig *PodDiscoveryConfig `json:"podDiscoveryConfig,omitempty"`
+	// DataParallelSizeLocal is the number of data-parallel ranks served by a
+	// single pod (vLLM DP_SIZE_LOCAL). Combined with ServingPortBase it maps a
+	// batch's global rank R to the emitting rank's serving endpoint port
+	// ServingPortBase + R % DataParallelSizeLocal. Default: 1.
+	DataParallelSizeLocal int `json:"dataParallelSizeLocal,omitempty"`
+	// ServingPortBase is the first serving port of a pod's data-parallel rank
+	// endpoints (each rank serves at PodIP:(ServingPortBase + local rank)).
+	// When > 0 and an event batch carries a global data-parallel rank, index
+	// entries are keyed by the emitting rank's serving endpoint
+	// <host>:(ServingPortBase + rank % DataParallelSizeLocal), with <host>
+	// taken from the topic-derived identifier. 0 keeps pod-granular
+	// identifiers.
+	ServingPortBase int `json:"servingPortBase,omitempty"`
 }
 
 // PodDiscoveryConfig holds configuration for the Kubernetes pod reconciler.
@@ -77,23 +92,33 @@ type PodDiscoveryConfig struct {
 	// The reconciler will connect to tcp://<PodIP>:<SocketPort>
 	// Default: 5557
 	SocketPort int `json:"socketPort"`
+	// DataParallelSizeTotal is the total number of data-parallel ranks across
+	// all pods (vLLM DP_SIZE). Each rank's ZMQ publisher binds
+	// SocketPort + GLOBAL rank on its pod, and a pod's global rank range is
+	// not knowable from the pod alone, so when > 1 the reconciler subscribes
+	// every discovered pod at SocketPort+i for i in [0, DataParallelSizeTotal)
+	// (ZMQ connects to never-bound ports are lazy and harmless). Default: 1
+	// (one subscriber per endpoint at SocketPort + rank index).
+	DataParallelSizeTotal int `json:"dataParallelSizeTotal,omitempty"`
 }
 
 // DefaultPodReconcilerConfig returns a default configuration for the pod reconciler.
 func DefaultPodReconcilerConfig() *PodDiscoveryConfig {
 	return &PodDiscoveryConfig{
-		PodLabelSelector: defaultPodSelector,
-		SocketPort:       5557,
+		PodLabelSelector:      defaultPodSelector,
+		SocketPort:            5557,
+		DataParallelSizeTotal: 1,
 	}
 }
 
 // DefaultConfig returns a default configuration for the event processing pool.
 func DefaultConfig() *Config {
 	return &Config{
-		TopicFilter:        "kv@",
-		Concurrency:        4,
-		DiscoverPods:       true,
-		PodDiscoveryConfig: DefaultPodReconcilerConfig(),
+		TopicFilter:           "kv@",
+		Concurrency:           4,
+		DiscoverPods:          true,
+		PodDiscoveryConfig:    DefaultPodReconcilerConfig(),
+		DataParallelSizeLocal: 1,
 	}
 }
 
@@ -114,6 +139,17 @@ type Pool struct {
 	// Index.Add succeeds — both of which only the Pool observes.
 	dedup *eventDedupFilter
 	wg    sync.WaitGroup
+
+	// dataParallelSizeLocal and servingPortBase key index entries by the
+	// emitting rank's serving endpoint instead of the pod; see
+	// dataParallelIdentity.
+	dataParallelSizeLocal int
+	servingPortBase       int
+	// dpRankByIdentifier maps each rank-qualified pod identifier to the
+	// global data-parallel rank that produced it, for downstream consumers
+	// that must target a specific rank (see GlobalDPRank).
+	dpRankMu           sync.RWMutex
+	dpRankByIdentifier map[string]int
 }
 
 // NewPool creates a Pool with a sharded worker setup.
@@ -126,14 +162,22 @@ func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProce
 		cfg = DefaultConfig()
 	}
 
+	dataParallelSizeLocal := cfg.DataParallelSizeLocal
+	if dataParallelSizeLocal < 1 {
+		dataParallelSizeLocal = 1
+	}
+
 	p := &Pool{
-		queues:         make([]workqueue.TypedRateLimitingInterface[*RawMessage], cfg.Concurrency),
-		concurrency:    cfg.Concurrency,
-		index:          index,
-		tokenProcessor: tokenProcessor,
-		adapter:        adapter,
-		groupCatalog:   kvblock.NewGroupCatalog(),
-		dedup:          newEventDedupFilter(),
+		queues:                make([]workqueue.TypedRateLimitingInterface[*RawMessage], cfg.Concurrency),
+		concurrency:           cfg.Concurrency,
+		index:                 index,
+		tokenProcessor:        tokenProcessor,
+		adapter:               adapter,
+		groupCatalog:          kvblock.NewGroupCatalog(),
+		dedup:                 newEventDedupFilter(),
+		dataParallelSizeLocal: dataParallelSizeLocal,
+		servingPortBase:       cfg.ServingPortBase,
+		dpRankByIdentifier:    make(map[string]int),
 	}
 
 	for i := 0; i < p.concurrency; i++ {
@@ -146,6 +190,45 @@ func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProce
 // GroupCatalog returns the KV cache group metadata learned from events.
 func (p *Pool) GroupCatalog() *kvblock.GroupCatalog {
 	return p.groupCatalog
+}
+
+// GlobalDPRank returns the global data-parallel rank behind a rank-qualified
+// pod identifier (as produced when ServingPortBase is set), or false when the
+// identifier has not appeared in any rank-annotated event batch. Safe for
+// concurrent use.
+func (p *Pool) GlobalDPRank(podIdentifier string) (int, bool) {
+	p.dpRankMu.RLock()
+	defer p.dpRankMu.RUnlock()
+	rank, ok := p.dpRankByIdentifier[podIdentifier]
+	return rank, ok
+}
+
+// dataParallelIdentity resolves the identity a batch's events are indexed and
+// reference-counted under. When ServingPortBase is set and the batch carries
+// a global data-parallel rank R, the identifier becomes the emitting rank's
+// serving endpoint <host>:(ServingPortBase + R % DataParallelSizeLocal), with
+// <host> taken from the topic-derived identifier, and R becomes the
+// dedup-scope rank so ranks reference-count independently — in lockstep with
+// the rank-granular index identity. Otherwise the topic-derived identifier
+// passes through untouched and the scope keeps the noDataParallelRank
+// sentinel: under pod-granular identity a block stays resident until every
+// rank has removed it, so counts must aggregate across ranks.
+func (p *Pool) dataParallelIdentity(podIdentifier string, dataParallelRank *int) (string, int) {
+	if p.servingPortBase <= 0 || dataParallelRank == nil || *dataParallelRank < 0 {
+		return podIdentifier, noDataParallelRank
+	}
+	rank := *dataParallelRank
+	host := podIdentifier
+	if h, _, err := net.SplitHostPort(podIdentifier); err == nil {
+		host = h
+	}
+	identifier := net.JoinHostPort(host, strconv.Itoa(p.servingPortBase+rank%p.dataParallelSizeLocal))
+
+	p.dpRankMu.Lock()
+	p.dpRankByIdentifier[identifier] = rank
+	p.dpRankMu.Unlock()
+
+	return identifier, rank
 }
 
 // Start begins the worker pool.
@@ -326,6 +409,7 @@ func (p *Pool) handleDeviceTierUpdate(
 
 // processEventBatch processes a batch of events using type switches.
 func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIdentifier, modelName string) {
+	podIdentifier, scopeRank := p.dataParallelIdentity(podIdentifier, batch.DataParallelRank)
 	debugLogger := log.FromContext(ctx).V(logging.DEBUG)
 	debugLogger.V(logging.TRACE).Info("Processing event batch",
 		"podID", podIdentifier,
@@ -339,13 +423,14 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			deviceTier := normalizeDeviceTier(ev.DeviceTier)
 
 			// Scope for reference-counting this store against duplicate removes.
-			// Mirrors the index eviction identity (pod, tier, group); DP rank is
-			// the sentinel until PR #370 makes the index DP-aware.
+			// Mirrors the index eviction identity (pod, tier, group) plus the
+			// batch's data-parallel rank when identifiers are rank-granular
+			// (see dataParallelIdentity).
 			storeScope := blockScope{
 				podIdentifier:    podIdentifier,
 				deviceTier:       deviceTier,
 				groupIdx:         groupIdxOrNoGroup(ev.GroupIdx),
-				dataParallelRank: noDataParallelRank,
+				dataParallelRank: scopeRank,
 			}
 
 			// Use LoRA name as model identifier if available, otherwise fall back to base model name.
@@ -477,7 +562,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				podIdentifier:    podIdentifier,
 				deviceTier:       deviceTier,
 				groupIdx:         groupIdxOrNoGroup(ev.GroupIdx),
-				dataParallelRank: noDataParallelRank,
+				dataParallelRank: scopeRank,
 			}
 			hashesToEvict := p.dedup.filterRemove(removeScope, ev.BlockHashes)
 

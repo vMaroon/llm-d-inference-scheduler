@@ -52,6 +52,10 @@ type GenericEvent interface {
 type EventBatch struct {
 	Timestamp float64
 	Events    []GenericEvent
+	// DataParallelRank is the global data-parallel rank of the engine that
+	// published the batch, when the engine annotates one (vLLM stamps it on
+	// every published batch under data parallelism). Nil when absent.
+	DataParallelRank *int
 }
 
 // RawMessage holds the raw transport-level data from a received pub/sub message.
