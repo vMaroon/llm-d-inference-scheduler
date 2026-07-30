@@ -291,8 +291,13 @@ func (m *InMemoryIndex) evictPodsFromRequestKey(requestKey, engineKey BlockHash,
 		return
 	}
 
-	// Remove key from main cache if empty.
-	// Re-fetch and hold the lock through removal to prevent racing with Add.
+	// Remove key from main cache if empty. Hold m.mu through the re-fetch,
+	// emptiness check, and removal: Add inserts entries while holding m.mu,
+	// so without it an Add that fetched this PodCache before the removal
+	// would insert into an orphaned cache and the entry would silently
+	// disappear from lookups. Lock order (m.mu then PodCache.mu) matches Add.
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	currentCache, stillExists := m.data.Get(requestKey)
 	if !stillExists || currentCache == nil {
 		return

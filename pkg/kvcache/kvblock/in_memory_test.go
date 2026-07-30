@@ -17,10 +17,13 @@ limitations under the License.
 package kvblock_test
 
 import (
+	"context"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	. "github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
@@ -221,4 +224,36 @@ func TestAddWithNilEngineKeys(t *testing.T) {
 	// GetRequestKey should NOT find a mapping (no engineKey was stored)
 	_, err = index.GetRequestKey(ctx, requestKey)
 	assert.Error(t, err, "GetRequestKey should fail since no engineKey mapping was created")
+}
+
+// A Clear that empties a request key must not orphan a PodCache another pod's
+// concurrent Add is inserting into: the added entry has to remain visible.
+func TestInMemoryIndex_ClearDoesNotOrphanConcurrentAdd(t *testing.T) {
+	ctx := context.Background()
+	key := []BlockHash{BlockHash(42)}
+	entryA := []PodEntry{{PodIdentifier: "pod-a", DeviceTier: "gpu"}}
+	entryB := []PodEntry{{PodIdentifier: "pod-b", DeviceTier: "gpu"}}
+
+	for i := 0; i < 2000; i++ {
+		idx, err := NewInMemoryIndex(nil)
+		require.NoError(t, err)
+		require.NoError(t, idx.Add(ctx, nil, key, entryA))
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			require.NoError(t, idx.Clear(ctx, "pod-a"))
+		}()
+		go func() {
+			defer wg.Done()
+			require.NoError(t, idx.Add(ctx, nil, key, entryB))
+		}()
+		wg.Wait()
+
+		pods, err := idx.Lookup(ctx, key, sets.New[string]())
+		require.NoError(t, err)
+		require.Contains(t, pods[key[0]], entryB[0],
+			"pod-b's concurrently added entry must survive Clear(pod-a)")
+	}
 }
