@@ -94,7 +94,10 @@ type Producer struct {
 	subscribersManager subscriberManager
 	kvEventsConfig     *kvevents.Config
 
-	kvBlockScorer kvcache.KVBlockScorer
+	// mediumWeights maps device-tier names to scoring weights for the
+	// weighted longest-prefix computation (kvcache.LongestPrefixScorer
+	// semantics, folded into endpointPrefixStats).
+	mediumWeights map[string]float64
 
 	dk plugin.DataKey
 
@@ -173,9 +176,9 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 	if config.IndexerConfig != nil && config.IndexerConfig.BackendConfigs != nil {
 		scorerConfig.BackendConfigs = config.IndexerConfig.BackendConfigs
 	}
-	kvBlockScorer, err := kvcache.NewKVBlockScorer(scorerConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create KVBlockScorer: %w", err)
+	mediumWeights := make(map[string]float64, len(scorerConfig.BackendConfigs))
+	for _, medium := range scorerConfig.BackendConfigs {
+		mediumWeights[medium.Name] = medium.Weight
 	}
 
 	pool := kvevents.NewPool(config.KVEventsConfig, indexer.KVBlockIndex(), tokenProcessor, engineadapter.NewVLLMAdapter())
@@ -197,7 +200,7 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 	return &Producer{
 		typedName:          plugin.TypedName{Type: PluginType, Name: name},
 		kvCacheIndexer:     indexer,
-		kvBlockScorer:      kvBlockScorer,
+		mediumWeights:      mediumWeights,
 		subscribersManager: subscribersManager,
 		kvEventsConfig:     config.KVEventsConfig,
 		dk:                 attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(name),
@@ -336,30 +339,27 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 	logger := log.FromContext(ctx).WithName(p.typedName.String())
 	endpointSet := extractEndpointSet(endpoints)
 
-	type promptLookup struct {
-		keys      []kvblock.BlockHash
-		keyToPods map[kvblock.BlockHash][]kvblock.PodEntry
-	}
-
-	aggregatedScores := make(map[string]float64)
+	aggregated := make(map[string]*endpointStats)
 	totalBlocks := 0
-	lookups := make([]promptLookup, 0, len(perPromptKeys))
 	for _, blockKeys := range perPromptKeys {
 		keyToPods, err := p.kvCacheIndexer.KVBlockIndex().Lookup(ctx, blockKeys, endpointSet)
 		if err != nil {
 			span.SetStatus(codes.Error, err.Error())
 			return fmt.Errorf("failed to lookup block keys: %w", err)
 		}
-		scores, err := p.kvBlockScorer.Score(ctx, blockKeys, keyToPods)
-		if err != nil {
-			span.SetStatus(codes.Error, err.Error())
-			return fmt.Errorf("failed to score block keys: %w", err)
-		}
-		for pod, score := range scores {
-			aggregatedScores[pod] += score
+		for pod, st := range endpointPrefixStats(blockKeys, keyToPods, p.mediumWeights) {
+			agg := aggregated[pod]
+			if agg == nil {
+				aggregated[pod] = st
+				continue
+			}
+			agg.weightedScore += st.weightedScore
+			agg.cachedBlocks += st.cachedBlocks
+			for tier, count := range st.cachedBlocksByTier {
+				agg.cachedBlocksByTier[tier] += count
+			}
 		}
 		totalBlocks += len(blockKeys)
-		lookups = append(lookups, promptLookup{keys: blockKeys, keyToPods: keyToPods})
 	}
 
 	maxMatch := 0
@@ -369,17 +369,16 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 			continue
 		}
 		addr := fmt.Sprintf("%s:%s", md.Address, md.Port)
-		matchLen := int(aggregatedScores[addr])
-		if matchLen > maxMatch {
-			maxMatch = matchLen
-		}
+		matchLen := 0
 		cachedBlocks := 0
 		cachedBlocksByTier := map[string]int{}
-		for _, lu := range lookups {
-			cachedBlocks += matchedBlockCount(lu.keys, lu.keyToPods, addr)
-			for tier, count := range matchedBlockCountByTier(lu.keys, lu.keyToPods, addr) {
-				cachedBlocksByTier[tier] += count
-			}
+		if st := aggregated[addr]; st != nil {
+			matchLen = int(st.weightedScore)
+			cachedBlocks = st.cachedBlocks
+			cachedBlocksByTier = st.cachedBlocksByTier
+		}
+		if matchLen > maxMatch {
+			maxMatch = matchLen
 		}
 		info := attrprefix.NewPrefixCacheMatchInfo(matchLen, totalBlocks, p.blockSizeTokens).
 			WithCachedBlockCount(cachedBlocks).
@@ -400,7 +399,12 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 		attribute.Int("llm_d.epp.producer.max_match_blocks", maxMatch),
 	)
 
-	logger.V(logging.TRACE).Info("Produce completed",
-		"blockKeys", totalBlocks, "scores", aggregatedScores)
+	if v := logger.V(logging.TRACE); v.Enabled() {
+		scores := make(map[string]float64, len(aggregated))
+		for pod, st := range aggregated {
+			scores[pod] = st.weightedScore
+		}
+		v.Info("Produce completed", "blockKeys", totalBlocks, "scores", scores)
+	}
 	return nil
 }

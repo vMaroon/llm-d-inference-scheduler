@@ -88,21 +88,6 @@ func (f *fakeKVBlockIndex) Clear(ctx context.Context, podIdentifier string) erro
 	return nil
 }
 
-type fakeKVBlockScorer struct {
-	score func(ctx context.Context, keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash][]kvblock.PodEntry) (map[string]float64, error)
-}
-
-func (f *fakeKVBlockScorer) Strategy() kvcache.KVScoringStrategy {
-	return kvcache.LongestPrefixMatch
-}
-
-func (f *fakeKVBlockScorer) Score(ctx context.Context, keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash][]kvblock.PodEntry) (map[string]float64, error) {
-	if f.score != nil {
-		return f.score(ctx, keys, keyToPods)
-	}
-	return map[string]float64{}, nil
-}
-
 var testEndpoints = []scheduling.Endpoint{
 	scheduling.NewEndpoint(
 		&fwkdl.EndpointMetadata{
@@ -137,12 +122,16 @@ func freshEndpoints() []scheduling.Endpoint {
 	}
 }
 
-func newProducerWithIndexer(ctx context.Context, idx kvCacheIndexer, scorer kvcache.KVBlockScorer) *Producer {
+func newProducerWithIndexer(ctx context.Context, idx kvCacheIndexer) *Producer {
+	mediumWeights := make(map[string]float64)
+	for _, medium := range kvcache.DefaultKVCacheBackendConfig() {
+		mediumWeights[medium.Name] = medium.Weight
+	}
 	return &Producer{
 		typedName:       plugin.TypedName{Type: PluginType, Name: "test"},
 		kvCacheIndexer:  idx,
-		kvBlockScorer:   scorer,
 		kvEventsConfig:  &kvevents.Config{},
+		mediumWeights:   mediumWeights,
 		dk:              attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test"),
 		pluginState:     plugin.NewPluginState(ctx),
 		blockSizeTokens: testBlockSize,
@@ -171,13 +160,7 @@ func TestProduce_UsesTokenizedPrompt(t *testing.T) {
 			},
 		},
 	}
-	scorer := &fakeKVBlockScorer{
-		score: func(_ context.Context, _ []kvblock.BlockHash, _ map[kvblock.BlockHash][]kvblock.PodEntry) (map[string]float64, error) {
-			return map[string]float64{"10.0.0.1:8080": 1.0}, nil
-		},
-	}
-
-	p := newProducerWithIndexer(ctx, idx, scorer)
+	p := newProducerWithIndexer(ctx, idx)
 
 	req := &scheduling.InferenceRequest{
 		RequestID:   "req-1",
@@ -217,7 +200,7 @@ func TestProduce_NoTokens_NoOp(t *testing.T) {
 		},
 		index: &fakeKVBlockIndex{},
 	}
-	p := newProducerWithIndexer(ctx, idx, &fakeKVBlockScorer{})
+	p := newProducerWithIndexer(ctx, idx)
 
 	req := &scheduling.InferenceRequest{
 		RequestID:   "req-2",
@@ -239,7 +222,7 @@ func TestProduce_EmptyTokenizedPrompt_NoOp(t *testing.T) {
 		},
 		index: &fakeKVBlockIndex{},
 	}
-	p := newProducerWithIndexer(ctx, idx, &fakeKVBlockScorer{})
+	p := newProducerWithIndexer(ctx, idx)
 
 	req := &scheduling.InferenceRequest{
 		RequestID:   "req-3",
@@ -275,14 +258,7 @@ func TestProduce_MultiPromptEmptyBlockKeys_NoOp(t *testing.T) {
 			},
 		},
 	}
-	scorer := &fakeKVBlockScorer{
-		score: func(_ context.Context, _ []kvblock.BlockHash, _ map[kvblock.BlockHash][]kvblock.PodEntry) (map[string]float64, error) {
-			t.Fatalf("Score must not be called when no prompt produces block keys")
-			return nil, assert.AnError
-		},
-	}
-
-	p := newProducerWithIndexer(ctx, idx, scorer)
+	p := newProducerWithIndexer(ctx, idx)
 	req := &scheduling.InferenceRequest{
 		RequestID:   "req-multi-empty",
 		TargetModel: "test-model",
@@ -333,14 +309,7 @@ func TestProduce_MultiPromptSkipsEmptyPromptKeys(t *testing.T) {
 			},
 		},
 	}
-	scorer := &fakeKVBlockScorer{
-		score: func(_ context.Context, keys []kvblock.BlockHash, _ map[kvblock.BlockHash][]kvblock.PodEntry) (map[string]float64, error) {
-			require.Equal(t, []kvblock.BlockHash{wantKey}, keys)
-			return map[string]float64{"10.0.0.1:8080": 1.0}, nil
-		},
-	}
-
-	p := newProducerWithIndexer(ctx, idx, scorer)
+	p := newProducerWithIndexer(ctx, idx)
 	req := &scheduling.InferenceRequest{
 		RequestID:   "req-multi-mixed",
 		TargetModel: "test-model",
@@ -407,13 +376,7 @@ func TestProduce_WritesCachedBlocksByTier(t *testing.T) {
 			},
 		},
 	}
-	scorer := &fakeKVBlockScorer{
-		score: func(_ context.Context, _ []kvblock.BlockHash, _ map[kvblock.BlockHash][]kvblock.PodEntry) (map[string]float64, error) {
-			return map[string]float64{"10.0.0.1:8080": 1.0}, nil
-		},
-	}
-
-	p := newProducerWithIndexer(ctx, idx, scorer)
+	p := newProducerWithIndexer(ctx, idx)
 	req := &scheduling.InferenceRequest{
 		RequestID:   "req-by-tier",
 		TargetModel: "test-model",
@@ -454,6 +417,8 @@ func TestProduce_MMMatchUsesCachedBlocksNotWeightedScore(t *testing.T) {
 	keys := []kvblock.BlockHash{0xAA, 0xBB, 0xCC, 0xDD}
 	const addr = "10.0.0.1:8080"
 
+	// cpu-tier entries score 0.8 per block (default medium weights), so the
+	// weighted score 4*0.8=3.2 gives matchLen=3 while all 4 blocks are cached.
 	idx := &fakeKVCacheIndexer{
 		computeFromTokens: func(_ context.Context, _ []uint32, _ string, _ []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
 			return keys, nil
@@ -462,20 +427,14 @@ func TestProduce_MMMatchUsesCachedBlocksNotWeightedScore(t *testing.T) {
 			lookup: func(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string]) (map[kvblock.BlockHash][]kvblock.PodEntry, error) {
 				out := map[kvblock.BlockHash][]kvblock.PodEntry{}
 				for _, k := range keys {
-					out[k] = []kvblock.PodEntry{{PodIdentifier: addr}}
+					out[k] = []kvblock.PodEntry{{PodIdentifier: addr, DeviceTier: "cpu"}}
 				}
 				return out, nil
 			},
 		},
 	}
-	// Weighted score 3.2 gives matchLen=3, while all 4 blocks are cached.
-	scorer := &fakeKVBlockScorer{
-		score: func(_ context.Context, _ []kvblock.BlockHash, _ map[kvblock.BlockHash][]kvblock.PodEntry) (map[string]float64, error) {
-			return map[string]float64{addr: 3.2}, nil
-		},
-	}
 
-	p := newProducerWithIndexer(ctx, idx, scorer)
+	p := newProducerWithIndexer(ctx, idx)
 	endpoints := freshEndpoints()
 
 	// MM at block index 3: caught by cachedBlocks=4, missed by matchLen=3.
@@ -526,9 +485,7 @@ func TestProduce_PassesMMExtraFeatures(t *testing.T) {
 			},
 		},
 	}
-	scorer := &fakeKVBlockScorer{}
-
-	p := newProducerWithIndexer(ctx, idx, scorer)
+	p := newProducerWithIndexer(ctx, idx)
 
 	req := &scheduling.InferenceRequest{
 		RequestID:   "req-mm",
@@ -584,7 +541,7 @@ func TestProduce_FoldsCacheSalt(t *testing.T) {
 				},
 				index: &fakeKVBlockIndex{},
 			}
-			p := newProducerWithIndexer(ctx, idx, &fakeKVBlockScorer{})
+			p := newProducerWithIndexer(ctx, idx)
 
 			req := &scheduling.InferenceRequest{
 				RequestID:   "req-salt",
@@ -622,7 +579,7 @@ func TestProduce_NoCacheSalt_NoExtraFeatures(t *testing.T) {
 		},
 		index: &fakeKVBlockIndex{},
 	}
-	p := newProducerWithIndexer(ctx, idx, &fakeKVBlockScorer{})
+	p := newProducerWithIndexer(ctx, idx)
 
 	req := &scheduling.InferenceRequest{
 		RequestID:   "req-nosalt",
@@ -646,7 +603,7 @@ func TestProduce_NoOpPaths(t *testing.T) {
 		},
 		index: &fakeKVBlockIndex{},
 	}
-	p := newProducerWithIndexer(ctx, idx, &fakeKVBlockScorer{})
+	p := newProducerWithIndexer(ctx, idx)
 
 	require.NoError(t, p.Produce(ctx, &scheduling.InferenceRequest{RequestID: "x"}, testEndpoints))
 	require.NoError(t, p.Produce(ctx, &scheduling.InferenceRequest{RequestID: "x", Body: &fwkrh.InferenceRequestBody{}}, testEndpoints))

@@ -18,7 +18,6 @@ package preciseprefixcache
 
 import (
 	"fmt"
-	"slices"
 
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -40,56 +39,99 @@ func extractEndpointSet(endpoints []scheduling.Endpoint) sets.Set[string] {
 	return endpointSet
 }
 
-// matchedBlockCount returns the number of contiguous cached prefix blocks held
-// by podID, counting from the first block until the first block the pod does
-// not hold. This is the unweighted counterpart of the device-tier-weighted
-// kvblock scorer: every cached block counts as one regardless of device tier,
-// so a pod present at keys[0..n-1] yields n.
-func matchedBlockCount(keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash][]kvblock.PodEntry, podID string) int {
-	count := 0
-	for _, key := range keys {
-		if !slices.ContainsFunc(keyToPods[key], func(e kvblock.PodEntry) bool { return e.PodIdentifier == podID }) {
-			break
-		}
-		count++
-	}
-	return count
+// endpointStats holds the prefix-match measurements for one pod, all derived
+// from the same contiguous-from-key-0 walk over a prompt's block keys.
+type endpointStats struct {
+	// weightedScore is the device-tier-weighted longest-prefix score
+	// (kvcache.LongestPrefixScorer semantics): per key, the pod's maximum
+	// entry weight across tiers, summed while the pod holds every key from
+	// the first.
+	weightedScore float64
+	// cachedBlocks is the unweighted length of the same contiguous run:
+	// every held block counts as one regardless of device tier.
+	cachedBlocks int
+	// cachedBlocksByTier counts, per device tier, the contiguous run the pod
+	// holds in that tier; a block held in several tiers counts once per tier,
+	// so each tier's count is at most cachedBlocks. Speculative entries count
+	// under attrprefix.SpeculativeTierKey: PreRequest inserts them before
+	// vLLM has reported placement, so they carry no device tier. A tier's run
+	// can end before the pod's run does. Non-nil, possibly empty.
+	cachedBlocksByTier map[string]int
 }
 
-// matchedBlockCountByTier returns, per device tier, the number of contiguous
-// cached prefix blocks podID holds in that tier, counting from the first
-// block until the first block the pod does not hold in that tier. A block
-// held in several tiers counts once per tier, so each tier's count is at most
-// matchedBlockCount for the same pod. Tiers are recorded as found in the
-// index, except speculative entries, which count under
-// attrprefix.SpeculativeTierKey: PreRequest inserts them before vLLM has
-// reported placement, so they carry no device tier.
-// Returns a non-nil (possibly empty) map.
-func matchedBlockCountByTier(keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash][]kvblock.PodEntry, podID string) map[string]int {
-	counts := map[string]int{}
-	var alive sets.Set[string]
-	for _, key := range keys {
-		tiersAtKey := sets.New[string]()
-		for _, e := range keyToPods[key] {
-			if e.PodIdentifier == podID {
-				if e.Speculative {
-					tiersAtKey.Insert(attrprefix.SpeculativeTierKey)
-				} else {
-					tiersAtKey.Insert(e.DeviceTier)
-				}
-			}
-		}
-		if alive == nil {
-			alive = tiersAtKey
-		} else {
-			alive = alive.Intersection(tiersAtKey)
-		}
-		if alive.Len() == 0 {
+// podScan is the per-pod walk state for endpointPrefixStats.
+type podScan struct {
+	stats *endpointStats
+	// aliveTiers maps tier -> index of the last key at which the tier's
+	// contiguous run was intact. A tier only advances when its recorded index
+	// matches the preceding key, so a gap retires it without allocating
+	// per-key tier sets.
+	aliveTiers map[string]int
+}
+
+// endpointPrefixStats walks keys once and returns per-pod endpointStats for
+// every pod holding the first key. Entry weight is mediumWeights by
+// DeviceTier with a 1.0 fallback; a pod leaves the run at the first key it
+// holds no entry for. Scratch maps are reused across keys so the walk
+// allocates per pod, not per key.
+func endpointPrefixStats(keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash][]kvblock.PodEntry,
+	mediumWeights map[string]float64,
+) map[string]*endpointStats {
+	stats := make(map[string]*endpointStats)
+	if len(keys) == 0 {
+		return stats
+	}
+
+	active := make(map[string]*podScan)
+	// Per-key max weight per pod; doubles as the presence marker for the
+	// contiguous-run check.
+	curWeights := make(map[string]float64)
+
+	for i, key := range keys {
+		if i > 0 && len(active) == 0 {
 			break
 		}
-		for tier := range alive {
-			counts[tier]++
+		clear(curWeights)
+		for _, e := range keyToPods[key] {
+			ps := active[e.PodIdentifier]
+			if ps == nil {
+				if i > 0 {
+					continue // pod's contiguous run ended (or never started)
+				}
+				st := &endpointStats{cachedBlocksByTier: map[string]int{}}
+				stats[e.PodIdentifier] = st
+				ps = &podScan{stats: st, aliveTiers: map[string]int{}}
+				active[e.PodIdentifier] = ps
+			}
+			weight := 1.0
+			if w, ok := mediumWeights[e.DeviceTier]; ok {
+				weight = w
+			}
+			if cur, ok := curWeights[e.PodIdentifier]; !ok || weight > cur {
+				curWeights[e.PodIdentifier] = weight
+			}
+			tier := e.DeviceTier
+			if e.Speculative {
+				tier = attrprefix.SpeculativeTierKey
+			}
+			if i == 0 {
+				if _, ok := ps.aliveTiers[tier]; !ok {
+					ps.aliveTiers[tier] = 0
+					ps.stats.cachedBlocksByTier[tier] = 1
+				}
+			} else if last, ok := ps.aliveTiers[tier]; ok && last == i-1 {
+				ps.aliveTiers[tier] = i
+				ps.stats.cachedBlocksByTier[tier]++
+			}
+		}
+		for pod, ps := range active {
+			if w, ok := curWeights[pod]; ok {
+				ps.stats.weightedScore += w
+				ps.stats.cachedBlocks++
+			} else {
+				delete(active, pod)
+			}
 		}
 	}
-	return counts
+	return stats
 }
