@@ -21,16 +21,19 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/metrics"
 )
 
 // newSeqTestSubscriber returns a subscriber whose pool is not started, so
-// tasks enqueued by checkSequence stay observable in the queues.
+// tasks enqueued by checkSequence stay observable in the queues. The empty
+// source endpoint exercises the topic-derived identity fallback; the
+// endpoint-identity path is covered by TestCheckSequence_SourceEndpointResync.
 func newSeqTestSubscriber(t *testing.T) (*zmqSubscriber, *Pool) {
 	t.Helper()
 	pool, _, _ := newTestPool(t, 16)
 	pool.adapter = fakeTopicAdapter{}
-	return newZMQSubscriber(pool, "seq-test-pod", "tcp://127.0.0.1:5557", "kv@", false), pool
+	return newZMQSubscriber(pool, "seq-test-pod", "", "tcp://127.0.0.1:5557", "kv@", false), pool
 }
 
 // drainTasks pops every queued task without running workers.
@@ -160,3 +163,57 @@ func TestConfig_ResyncOnSeqGapResolution(t *testing.T) {
 }
 
 func ptrBool(b bool) *bool { return &b }
+
+// TestCheckSequence_SourceEndpointResync pins the reset task's identity to the
+// one regular events are indexed and sharded under: with a subscriber-serving
+// endpoint set, the reset carries it, lands on the same worker queue as the
+// subscriber's regular messages, and clears exactly that identity.
+func TestCheckSequence_SourceEndpointResync(t *testing.T) {
+	const sourceEndpoint = "10.9.9.9:8000"
+	topic := "kv@pod-a@model"
+
+	pool, idx, _ := newTestPool(t, 16)
+	pool.adapter = fakeTopicAdapter{}
+	sub := newZMQSubscriber(pool, "seq-test-pod", sourceEndpoint, "tcp://127.0.0.1:5557", "kv@", false)
+
+	ctx := t.Context()
+	key := []kvblock.BlockHash{kvblock.BlockHash(1234)}
+	require.NoError(t, idx.Add(ctx, nil, key,
+		[]kvblock.PodEntry{{PodIdentifier: sourceEndpoint, DeviceTier: "gpu"}}))
+	require.NoError(t, idx.Add(ctx, nil, key,
+		[]kvblock.PodEntry{{PodIdentifier: "pod-a", DeviceTier: "gpu"}}))
+
+	sub.checkSequence(logr.Discard(), topic, 1)
+	sub.checkSequence(logr.Discard(), topic, 5) // gap: expected 2
+
+	// The reset and a regular message from the same subscriber must land on
+	// the same worker queue: the endpoint identity is the sharding key.
+	sub.pool.AddTask(&RawMessage{Topic: topic, SourceEndpoint: sourceEndpoint, Payload: []byte("x")})
+	occupied := 0
+	var tasks []*RawMessage
+	for _, q := range pool.queues {
+		if q.Len() > 0 {
+			occupied++
+			for q.Len() > 0 {
+				task, _ := q.Get()
+				q.Done(task)
+				tasks = append(tasks, task)
+			}
+		}
+	}
+	assert.Equal(t, 1, occupied, "reset and regular message must share one ordered queue")
+	require.Len(t, tasks, 2)
+	require.True(t, tasks[0].Reset, "reset must precede the gapped message's successors")
+	assert.Equal(t, sourceEndpoint, tasks[0].SourceEndpoint)
+
+	// Processing the reset clears the endpoint identity and nothing else.
+	pool.processRawMessage(ctx, tasks[0])
+	pods, err := idx.Lookup(ctx, key, nil)
+	require.NoError(t, err)
+	assert.NotContains(t, pods[key[0]],
+		kvblock.PodEntry{PodIdentifier: sourceEndpoint, DeviceTier: "gpu"},
+		"reset must clear the source-endpoint identity regular events are indexed under")
+	assert.Contains(t, pods[key[0]],
+		kvblock.PodEntry{PodIdentifier: "pod-a", DeviceTier: "gpu"},
+		"other identities must survive the reset")
+}

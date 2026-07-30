@@ -34,11 +34,12 @@ const (
 
 // zmqSubscriber connects to a ZMQ publisher and forwards messages to a pool.
 type zmqSubscriber struct {
-	pool          *Pool
-	podIdentifier string
-	endpoint      string
-	remote        bool
-	topicFilter   string
+	pool           *Pool
+	podIdentifier  string
+	sourceEndpoint string
+	endpoint       string
+	remote         bool
+	topicFilter    string
 	// lastSeq tracks the last sequence number seen per topic. Accessed only
 	// from the runSubscriber goroutine; it survives reconnects so messages
 	// dropped across a reconnect are detected as a gap.
@@ -46,14 +47,15 @@ type zmqSubscriber struct {
 }
 
 // newZMQSubscriber creates a new ZMQ subscriber.
-func newZMQSubscriber(pool *Pool, podIdentifier, endpoint, topicFilter string, remote bool) *zmqSubscriber {
+func newZMQSubscriber(pool *Pool, podIdentifier, sourceEndpoint, endpoint, topicFilter string, remote bool) *zmqSubscriber {
 	return &zmqSubscriber{
-		pool:          pool,
-		podIdentifier: podIdentifier,
-		endpoint:      endpoint,
-		remote:        remote,
-		topicFilter:   topicFilter,
-		lastSeq:       make(map[string]uint64),
+		pool:           pool,
+		podIdentifier:  podIdentifier,
+		sourceEndpoint: sourceEndpoint,
+		endpoint:       endpoint,
+		remote:         remote,
+		topicFilter:    topicFilter,
+		lastSeq:        make(map[string]uint64),
 	}
 }
 
@@ -156,9 +158,10 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 		z.checkSequence(logger, topic, seq)
 
 		z.pool.AddTask(&RawMessage{
-			Topic:    topic,
-			Sequence: seq,
-			Payload:  payload,
+			Topic:          topic,
+			Sequence:       seq,
+			Payload:        payload,
+			SourceEndpoint: z.sourceEndpoint,
 		})
 	}
 }
@@ -181,6 +184,6 @@ func (z *zmqSubscriber) checkSequence(logger logr.Logger, topic string, seq uint
 		"topic", topic, "endpoint", z.endpoint, "expected", last+1, "got", seq)
 
 	if z.pool.resyncOnSeqGap {
-		z.pool.AddTask(&RawMessage{Topic: topic, Reset: true})
+		z.pool.AddTask(&RawMessage{Topic: topic, SourceEndpoint: z.sourceEndpoint, Reset: true})
 	}
 }

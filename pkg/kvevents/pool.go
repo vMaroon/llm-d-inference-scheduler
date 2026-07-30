@@ -213,9 +213,12 @@ func (p *Pool) Shutdown(ctx context.Context) {
 
 // AddTask is called by the subscriber to add a message to the processing queue.
 // It hashes the sharding key to select a queue, ensuring messages for the
-// same pod always go to the same worker (ordered queue).
+// same source endpoint always go to the same worker (ordered queue).
 func (p *Pool) AddTask(task *RawMessage) {
-	key := p.adapter.ShardingKey(task)
+	key := task.SourceEndpoint
+	if key == "" {
+		key = p.adapter.ShardingKey(task)
+	}
 	// Use an FNV-1a hash to deterministically select a queue.
 	h := fnv.New32a()
 	_, err := h.Write([]byte(key))
@@ -268,7 +271,14 @@ func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 	logger := log.FromContext(ctx)
 
 	if msg.Reset {
-		podIdentifier := p.adapter.ShardingKey(msg)
+		// Resolve the pod identity exactly as the regular message path does:
+		// SourceEndpoint when set, topic-derived otherwise. A mismatch would
+		// shard the reset away from the pod's ordered queue or clear an
+		// identity the index never stored.
+		podIdentifier := msg.SourceEndpoint
+		if podIdentifier == "" {
+			podIdentifier = p.adapter.ShardingKey(msg)
+		}
 		logger.Info("Resyncing pod state after sequence discontinuity",
 			"podIdentifier", podIdentifier, "topic", msg.Topic)
 		if err := p.index.Clear(ctx, podIdentifier); err != nil {
@@ -282,6 +292,9 @@ func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 	if err != nil {
 		logger.Error(err, "Failed to parse message")
 		return
+	}
+	if msg.SourceEndpoint != "" {
+		podID = msg.SourceEndpoint
 	}
 
 	p.processEventBatch(ctx, &batch, podID, modelName)
