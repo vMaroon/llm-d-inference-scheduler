@@ -33,7 +33,7 @@ upstream. No-op otherwise.
 | `tokenProcessorConfig` | object | `kvblock.DefaultTokenProcessorConfig()` | KV-block hashing for the EPP-recomputed keys (block size, hash seed). |
 | `indexerConfig` | object | `kvcache.NewDefaultConfig()` | `kvcache.Indexer` config. |
 | `kvEventsConfig` | object | `kvevents.DefaultConfig()` | KV-events pool config. |
-| `speculativeIndexing` | bool | `false` | Seed predicted entries on routing decisions. |
+| `speculativeIndexing` | bool | `true` | Seed predicted entries on routing decisions. |
 | `speculativeTTL` | duration | `2s` | TTL for speculative entries. |
 
 See [llm-d-kv-cache/docs/configuration.md](https://github.com/llm-d/llm-d-kv-cache/blob/main/docs/configuration.md)

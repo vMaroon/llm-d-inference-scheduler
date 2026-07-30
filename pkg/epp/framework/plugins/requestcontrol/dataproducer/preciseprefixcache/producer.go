@@ -58,7 +58,8 @@ type PluginConfig struct {
 	// SpeculativeIndexing seeds predicted cache entries for the selected
 	// endpoint(s) immediately after a routing decision, so the next
 	// same-prefix request hits without waiting for engine confirmation.
-	SpeculativeIndexing bool `json:"speculativeIndexing"`
+	// Enabled unless explicitly set to false.
+	SpeculativeIndexing *bool `json:"speculativeIndexing"`
 	// SpeculativeTTL bounds how long speculative entries live before
 	// eviction. Go duration string; defaults to defaultSpeculativeTTL when
 	// empty.
@@ -192,7 +193,9 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		}
 	}
 
-	speculativeCache, speculativeTTL, err := buildSpeculativeCache(ctx, config, indexer.KVBlockIndex())
+	speculativeEnabled := config.SpeculativeIndexing == nil || *config.SpeculativeIndexing
+	speculativeCache, speculativeTTL, err := buildSpeculativeCache(ctx, speculativeEnabled,
+		config.SpeculativeTTL, indexer.KVBlockIndex())
 	if err != nil {
 		return nil, err
 	}
@@ -207,7 +210,7 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		pluginState:        plugin.NewPluginState(ctx),
 		speculativeCache:   speculativeCache,
 		speculativeTTL:     speculativeTTL,
-		speculativeEnabled: config.SpeculativeIndexing,
+		speculativeEnabled: speculativeEnabled,
 		blockSizeTokens:    tokenProcessor.BlockSize(),
 		subscriberCtx:      ctx,
 	}, nil

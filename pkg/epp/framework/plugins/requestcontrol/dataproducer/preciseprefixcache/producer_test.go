@@ -619,6 +619,36 @@ func TestPluginFactory_RejectsTokenizersPoolConfig(t *testing.T) {
 	require.Contains(t, err.Error(), "tokenizersPoolConfig is not supported")
 }
 
+// speculativeIndexing defaults to enabled; explicit false disables it and
+// explicit true enables it.
+func TestPluginFactory_SpeculativeIndexingDefault(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  json.RawMessage
+		want bool
+	}{
+		{name: "omitted enables", raw: json.RawMessage(`{}`), want: true},
+		{name: "explicit false disables", raw: json.RawMessage(`{"speculativeIndexing":false}`), want: false},
+		{name: "explicit true enables", raw: json.RawMessage(`{"speculativeIndexing":true}`), want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Cancel on test exit so the indexer.Run + kvevents pool workers
+			// New() launches don't outlive the subtest.
+			ctx, cancel := context.WithCancel(utils.NewTestContext(t))
+			t.Cleanup(cancel)
+			handle := plugin.NewEppHandle(ctx, nil)
+
+			plg, err := PluginFactory("test", plugin.StrictDecoder(tc.raw), handle)
+			require.NoError(t, err)
+			p, ok := plg.(*Producer)
+			require.True(t, ok)
+			assert.Equal(t, tc.want, p.speculativeEnabled)
+			assert.Equal(t, tc.want, p.speculativeCache != nil)
+		})
+	}
+}
+
 // Key built from string literals so an upstream rename trips the test.
 func TestProduces_DeclaresPrefixCacheMatchInfo(t *testing.T) {
 	p := &Producer{

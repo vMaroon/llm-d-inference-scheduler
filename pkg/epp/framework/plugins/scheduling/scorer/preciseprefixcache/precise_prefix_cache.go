@@ -52,8 +52,11 @@ type PluginConfig struct {
 	TokenProcessorConfig *kvblock.TokenProcessorConfig `json:"tokenProcessorConfig"`
 	IndexerConfig        *kvcache.Config               `json:"indexerConfig"`
 	KVEventsConfig       *kvevents.Config              `json:"kvEventsConfig"`
-	SpeculativeIndexing  bool                          `json:"speculativeIndexing"`
-	SpeculativeTTL       string                        `json:"speculativeTTL"`
+	// SpeculativeIndexing defaults to false here, unlike the standalone
+	// precise-prefix-cache-producer where omitting it enables speculation:
+	// the plain bool forwards an explicit value to the producer config.
+	SpeculativeIndexing bool   `json:"speculativeIndexing"`
+	SpeculativeTTL      string `json:"speculativeTTL"`
 }
 
 // Plugin composes a precise-prefix-cache-producer and a prefix-cache-scorer
@@ -118,7 +121,7 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 		TokenProcessorConfig: legacy.TokenProcessorConfig,
 		IndexerConfig:        legacy.IndexerConfig,
 		KVEventsConfig:       legacy.KVEventsConfig,
-		SpeculativeIndexing:  legacy.SpeculativeIndexing,
+		SpeculativeIndexing:  &legacy.SpeculativeIndexing,
 		SpeculativeTTL:       legacy.SpeculativeTTL,
 	}
 

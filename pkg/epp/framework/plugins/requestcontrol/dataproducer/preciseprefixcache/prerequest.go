@@ -65,20 +65,21 @@ func (s *blockKeysState) Clone() plugin.StateData {
 }
 
 // buildSpeculativeCache constructs the TTL cache used to evict speculative
-// index entries. Returns (nil, 0, nil) when speculative indexing is disabled.
-// The cache and its background goroutine are bound to ctx.
-func buildSpeculativeCache(ctx context.Context, config PluginConfig,
+// index entries. Returns (nil, 0, nil) when enabled is false. speculativeTTL
+// is a Go duration string; empty selects defaultSpeculativeTTL. The cache and
+// its background goroutine are bound to ctx.
+func buildSpeculativeCache(ctx context.Context, enabled bool, speculativeTTL string,
 	index kvblock.Index,
 ) (*ttlcache.Cache[string, *speculativeEntries], time.Duration, error) {
-	if !config.SpeculativeIndexing {
+	if !enabled {
 		return nil, 0, nil
 	}
 
 	ttl := defaultSpeculativeTTL
-	if config.SpeculativeTTL != "" {
-		parsed, err := time.ParseDuration(config.SpeculativeTTL)
+	if speculativeTTL != "" {
+		parsed, err := time.ParseDuration(speculativeTTL)
 		if err != nil {
-			return nil, 0, fmt.Errorf("invalid speculativeTTL %q: %w", config.SpeculativeTTL, err)
+			return nil, 0, fmt.Errorf("invalid speculativeTTL %q: %w", speculativeTTL, err)
 		}
 		if parsed > 0 {
 			ttl = parsed
