@@ -17,6 +17,7 @@ limitations under the License.
 package kvblock_test
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -221,4 +222,52 @@ func TestAddWithNilEngineKeys(t *testing.T) {
 	// GetRequestKey should NOT find a mapping (no engineKey was stored)
 	_, err = index.GetRequestKey(ctx, requestKey)
 	assert.Error(t, err, "GetRequestKey should fail since no engineKey mapping was created")
+}
+
+// A speculative Add on a full PodCache must not displace confirmed entries:
+// the TTL rollback removes only the speculative entry, so a displaced
+// confirmed entry would be lost until the engine evicts and re-stores the
+// block. The hint is dropped instead.
+func TestSpeculativeAddDoesNotDisplaceConfirmedEntries(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(t.Context())
+	index, err := NewInMemoryIndex(DefaultInMemoryIndexConfig()) // PodCacheSize 10
+	require.NoError(t, err)
+
+	requestKey := BlockHash(55555555)
+	confirmed := make([]PodEntry, 10)
+	for i := range confirmed {
+		confirmed[i] = PodEntry{PodIdentifier: fmt.Sprintf("10.0.0.%d:8080", i), DeviceTier: "gpu"}
+	}
+	require.NoError(t, index.Add(ctx, nil, []BlockHash{requestKey}, confirmed))
+
+	speculative := PodEntry{PodIdentifier: "10.0.0.3:8080", Speculative: true}
+	require.NoError(t, index.Add(ctx, nil, []BlockHash{requestKey}, []PodEntry{speculative}))
+
+	podsPerKey, err := index.Lookup(ctx, []BlockHash{requestKey}, nil)
+	require.NoError(t, err)
+	assert.Len(t, podsPerKey[requestKey], 10, "speculative hint must be dropped, not displace an entry")
+	for _, entry := range confirmed {
+		assert.Contains(t, podsPerKey[requestKey], entry)
+	}
+	assert.NotContains(t, podsPerKey[requestKey], speculative)
+
+	// TTL rollback of the dropped hint is a no-op and leaves all confirmed
+	// entries intact.
+	require.NoError(t, index.Evict(ctx, requestKey, RequestKey, []PodEntry{speculative}))
+	podsPerKey, err = index.Lookup(ctx, []BlockHash{requestKey}, nil)
+	require.NoError(t, err)
+	assert.Len(t, podsPerKey[requestKey], 10)
+
+	// A speculative entry already present refreshes in place even at cap.
+	spare, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 10, PodCacheSize: 2})
+	require.NoError(t, err)
+	specA := PodEntry{PodIdentifier: "10.0.1.1:8080", Speculative: true}
+	require.NoError(t, spare.Add(ctx, nil, []BlockHash{requestKey}, []PodEntry{specA}))
+	require.NoError(t, spare.Add(ctx, nil, []BlockHash{requestKey},
+		[]PodEntry{{PodIdentifier: "10.0.1.2:8080", DeviceTier: "gpu"}}))
+	require.NoError(t, spare.Add(ctx, nil, []BlockHash{requestKey}, []PodEntry{specA}))
+	podsPerKey, err = spare.Lookup(ctx, []BlockHash{requestKey}, nil)
+	require.NoError(t, err)
+	assert.Len(t, podsPerKey[requestKey], 2)
+	assert.Contains(t, podsPerKey[requestKey], specA)
 }

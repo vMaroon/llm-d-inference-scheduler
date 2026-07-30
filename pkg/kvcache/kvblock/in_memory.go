@@ -215,6 +215,15 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 
 		podCache.mu.Lock()
 		for _, entry := range entries {
+			// Speculative entries are best-effort hints: adding one to a full
+			// PodCache would LRU-evict another entry, and an evicted confirmed
+			// entry is lost for good — the TTL rollback removes only the
+			// speculative entry and engines do not re-announce blocks they
+			// already store. Drop the hint instead of displacing state.
+			if entry.Speculative && podCache.cache.Len() >= m.podCacheSize &&
+				!podCache.cache.Contains(entry) {
+				continue
+			}
 			podCache.cache.Add(entry, struct{}{})
 		}
 		podCache.mu.Unlock()

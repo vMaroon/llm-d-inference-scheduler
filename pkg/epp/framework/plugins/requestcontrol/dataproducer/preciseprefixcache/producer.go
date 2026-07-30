@@ -58,7 +58,8 @@ type PluginConfig struct {
 	// SpeculativeIndexing seeds predicted cache entries for the selected
 	// endpoint(s) immediately after a routing decision, so the next
 	// same-prefix request hits without waiting for engine confirmation.
-	// Enabled unless explicitly set to false.
+	// Enabled unless explicitly set to false; a JSON null is treated as
+	// unset (enabled).
 	SpeculativeIndexing *bool `json:"speculativeIndexing"`
 	// SpeculativeTTL bounds how long speculative entries live before
 	// eviction. Go duration string; defaults to defaultSpeculativeTTL when
