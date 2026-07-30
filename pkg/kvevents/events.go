@@ -63,6 +63,13 @@ type RawMessage struct {
 	Sequence uint64
 	// Payload is the raw encoded event batch bytes, not yet decoded.
 	Payload []byte
+	// Reset marks an internal resync task injected when a sequence
+	// discontinuity is detected on Topic: the worker clears the pod's index
+	// entries and dedup state instead of parsing Payload. A reset task carries
+	// the originating Topic so EngineAdapter.ShardingKey routes it through the
+	// same ordered queue as the pod's regular messages; the pod identifier is
+	// recovered from that key.
+	Reset bool
 }
 
 // EngineAdapter defines the interface for engine-specific message parsers.

@@ -2,6 +2,7 @@ package kvevents //nolint:testpackage // tests use unexported processEventBatch
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,24 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/metrics"
 )
+
+// fakeTopicAdapter shards and parses by the "kv@<pod-id>@<model-name>" topic
+// layout without decoding payloads. Internal tests cannot use the real
+// engineadapter package (import cycle), and reset tasks only exercise
+// ShardingKey.
+type fakeTopicAdapter struct{}
+
+func (fakeTopicAdapter) ParseMessage(msg *RawMessage) (string, string, EventBatch, error) {
+	return fakeTopicAdapter{}.ShardingKey(msg), "", EventBatch{}, nil
+}
+
+func (fakeTopicAdapter) ShardingKey(msg *RawMessage) string {
+	parts := strings.Split(msg.Topic, "@")
+	if len(parts) == 3 {
+		return parts[1]
+	}
+	return msg.Topic
+}
 
 // newTestPool creates a Pool with real InMemoryIndex and
 // ChunkedTokenDatabase. blockSize (blockSizeTokens) is the canonical block size used by the
@@ -1163,4 +1182,55 @@ func counterValue(t *testing.T, c prometheus.Counter) float64 {
 	var m dto.Metric
 	require.NoError(t, c.Write(&m))
 	return m.GetCounter().GetValue()
+}
+
+// TestPool_ResetTaskClearsPodState verifies that a Reset RawMessage clears the
+// pod named by its topic (index entries and dedup reference counts) while
+// leaving other pods untouched, mirroring the AllBlocksClearedEvent handling.
+func TestPool_ResetTaskClearsPodState(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, tp := newTestPool(t, 16)
+	pool.adapter = fakeTopicAdapter{}
+
+	tokens := makeTokens(64)
+	engineKeys := makeEngineKeys(4, 1000)
+
+	store := func(podID string, base uint64) {
+		pool.processEventBatch(ctx, &EventBatch{
+			Events: []GenericEvent{
+				&BlockStoredEvent{BlockHashes: makeEngineKeys(4, base), Tokens: tokens, ParentHash: 0},
+			},
+		}, podID, "test-model")
+	}
+
+	// Two stores for pod-reset -> dedup refcount 2; one store for pod-kept.
+	store("pod-reset", 1000)
+	store("pod-reset", 1000)
+	store("pod-kept", 2000)
+
+	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	require.NoError(t, err)
+	require.NotEmpty(t, canonicalKeys)
+
+	pool.processRawMessage(ctx, &RawMessage{Topic: "kv@pod-reset@test-model", Reset: true})
+
+	// Index: only pod-kept survives on the shared canonical keys.
+	for _, ck := range canonicalKeys {
+		result, err := idx.Lookup(ctx, []kvblock.BlockHash{ck}, nil)
+		require.NoError(t, err)
+		require.Len(t, result[ck], 1, "only the untouched pod should remain on key %s", ck)
+		assert.Equal(t, "pod-kept", result[ck][0].PodIdentifier)
+	}
+
+	// Dedup: the refcount of 2 must be wiped, so a remove on the same scope
+	// passes straight through instead of being suppressed.
+	scope := blockScope{
+		podIdentifier:    "pod-reset",
+		deviceTier:       defaultEventSourceDeviceTier,
+		groupIdx:         noGroupIdx,
+		dataParallelRank: noDataParallelRank,
+	}
+	kept := pool.dedup.filterRemove(scope, engineKeys)
+	assert.Equal(t, engineKeys, kept,
+		"reset must wipe dedup reference counts; the remove passes through")
 }

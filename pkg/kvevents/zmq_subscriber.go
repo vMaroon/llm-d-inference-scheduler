@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"time"
 
+	"github.com/go-logr/logr"
 	zmq4 "github.com/go-zeromq/zmq4"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -38,6 +39,10 @@ type zmqSubscriber struct {
 	endpoint      string
 	remote        bool
 	topicFilter   string
+	// lastSeq tracks the last sequence number seen per topic. Accessed only
+	// from the runSubscriber goroutine; it survives reconnects so messages
+	// dropped across a reconnect are detected as a gap.
+	lastSeq map[string]uint64
 }
 
 // newZMQSubscriber creates a new ZMQ subscriber.
@@ -48,6 +53,7 @@ func newZMQSubscriber(pool *Pool, podIdentifier, endpoint, topicFilter string, r
 		endpoint:      endpoint,
 		remote:        remote,
 		topicFilter:   topicFilter,
+		lastSeq:       make(map[string]uint64),
 	}
 }
 
@@ -147,10 +153,34 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 			"seq", seq,
 			"payloadSize", len(payload))
 
+		z.checkSequence(logger, topic, seq)
+
 		z.pool.AddTask(&RawMessage{
 			Topic:    topic,
 			Sequence: seq,
 			Payload:  payload,
 		})
+	}
+}
+
+// checkSequence tracks per-topic sequence continuity. The first message on a
+// topic baselines silently. Any other discontinuity (a forward gap means
+// dropped messages, a regression means a publisher restart) is counted and
+// logged unconditionally; when resync is enabled, a reset task is enqueued
+// ahead of the current message so the pod's potentially stale entries are
+// cleared in order and subsequent events rebuild them.
+func (z *zmqSubscriber) checkSequence(logger logr.Logger, topic string, seq uint64) {
+	last, seen := z.lastSeq[topic]
+	z.lastSeq[topic] = seq
+	if !seen || seq == last+1 {
+		return
+	}
+
+	metrics.SequenceGaps.Inc()
+	logger.Error(nil, "Sequence discontinuity on KV-event topic",
+		"topic", topic, "endpoint", z.endpoint, "expected", last+1, "got", seq)
+
+	if z.pool.resyncOnSeqGap {
+		z.pool.AddTask(&RawMessage{Topic: topic, Reset: true})
 	}
 }

@@ -64,6 +64,15 @@ type Config struct {
 	// PodDiscoveryConfig holds the configuration for pod discovery.
 	// Only used when DiscoverPods is true.
 	PodDiscoveryConfig *PodDiscoveryConfig `json:"podDiscoveryConfig,omitempty"`
+	// ResyncOnSeqGap clears a pod's index and dedup state when a ZMQ sequence
+	// discontinuity is detected on its topic, letting subsequent events
+	// rebuild the entries. Detection and the gap counter metric are
+	// unconditional; this only gates the resync. nil resolves to true.
+	// Assumes one publisher per topic: interleaved sequence counters from
+	// multiple publishers on a shared topic register as continuous
+	// discontinuities and would clear the pod on nearly every event, so
+	// disable the resync in such deployments.
+	ResyncOnSeqGap *bool `json:"resyncOnSeqGap,omitempty"`
 }
 
 // PodDiscoveryConfig holds configuration for the Kubernetes pod reconciler.
@@ -114,7 +123,9 @@ type Pool struct {
 	// tier, KV-cache group, DP rank) and a store must be counted only after
 	// Index.Add succeeds — both of which only the Pool observes.
 	dedup *eventDedupFilter
-	wg    sync.WaitGroup
+	// resyncOnSeqGap is Config.ResyncOnSeqGap with nil resolved to true.
+	resyncOnSeqGap bool
+	wg             sync.WaitGroup
 	// queueDepth mirrors the number of tasks queued across all shards. It is
 	// tracked incrementally rather than by summing queue.Len() so that the
 	// depth gauge stays O(1) on the enqueue/dequeue hot path.
@@ -143,6 +154,7 @@ func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProce
 		adapter:        adapter,
 		groupCatalog:   kvblock.NewGroupCatalog(),
 		dedup:          newEventDedupFilter(),
+		resyncOnSeqGap: cfg.ResyncOnSeqGap == nil || *cfg.ResyncOnSeqGap,
 	}
 
 	for i := 0; i < p.concurrency; i++ {
@@ -247,8 +259,24 @@ func (p *Pool) worker(ctx context.Context, workerIndex int) {
 }
 
 // processRawMessage decodes the raw message payload using the adapter and processes the resulting event batch.
+// Reset tasks skip decoding: the pod's index entries and dedup state are
+// cleared, mirroring the AllBlocksClearedEvent handling, and subsequent
+// events rebuild them. The sharding key is the pod identifier extracted from
+// the task's topic, the same value ParseMessage reports for the pod's
+// regular messages.
 func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 	logger := log.FromContext(ctx)
+
+	if msg.Reset {
+		podIdentifier := p.adapter.ShardingKey(msg)
+		logger.Info("Resyncing pod state after sequence discontinuity",
+			"podIdentifier", podIdentifier, "topic", msg.Topic)
+		if err := p.index.Clear(ctx, podIdentifier); err != nil {
+			logger.Error(err, "Failed to clear pod from index", "podIdentifier", podIdentifier)
+		}
+		p.dedup.clear(podIdentifier)
+		return
+	}
 
 	podID, modelName, batch, err := p.adapter.ParseMessage(msg)
 	if err != nil {

@@ -181,6 +181,13 @@ var (
 		Help: metricsutil.HelpMsgWithStability(
 			"Number of worker shards (capacity) in the event processing pool", compbasemetrics.ALPHA),
 	})
+	// SequenceGaps counts ZMQ sequence discontinuities detected on KV-event
+	// topics: a forward gap means dropped messages, a regression means a
+	// publisher restart. Detection is unconditional; whether a discontinuity
+	// also triggers a pod resync is governed by kvevents.Config.ResyncOnSeqGap.
+	SequenceGaps = newDualCounter("kvevents", "sequence_gaps_total",
+		"kv_cache_events_sequence_gaps_total",
+		"ZMQ sequence discontinuities detected on KV-event topics (dropped messages or publisher restart)")
 )
 
 // Collectors returns a slice of all registered Prometheus collectors.
@@ -191,6 +198,7 @@ func Collectors() []prometheus.Collector {
 		DedupRemovedHashesSuppressed, DedupRemovedHashesForwarded,
 		SubscriberActive, SubscriberReconnections, MessagesReceived, ZMQErrors,
 		PoolQueueDepth, PoolCapacity,
+		SequenceGaps,
 	}
 }
 
