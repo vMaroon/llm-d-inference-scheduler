@@ -35,7 +35,7 @@ var (
 			Name:      "inflight_requests",
 			Help:      metricsutil.HelpMsgWithStability("Current number of in-flight requests per endpoint, as tracked by the in-flight load producer.", compbasemetrics.ALPHA),
 		},
-		[]string{"endpoint_name", "namespace", "producer_name", "fairness_id", "priority"},
+		[]string{"endpoint_name", "namespace", "producer_name"},
 	)
 
 	inflightTokens = prometheus.NewGaugeVec(
@@ -44,7 +44,7 @@ var (
 			Name:      "inflight_tokens",
 			Help:      metricsutil.HelpMsgWithStability("Current number of in-flight tokens per endpoint (uncached prompt tokens, optionally plus estimated output), as tracked by the in-flight load producer.", compbasemetrics.ALPHA),
 		},
-		[]string{"endpoint_name", "namespace", "producer_name", "fairness_id", "priority"},
+		[]string{"endpoint_name", "namespace", "producer_name"},
 	)
 )
 

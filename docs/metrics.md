@@ -346,8 +346,6 @@ per-endpoint gauges are updated as requests are admitted and released.
     *   `endpoint_name`: string — the target endpoint (pod) name.
     *   `namespace`: string — the endpoint's namespace.
     *   `producer_name`: string — the configured `InFlightLoadProducer` instance name, so multiple producers emit distinct series.
-    *   `fairness_id`: string — the flow-control fairness queue identity.
-    *   `priority`: string — the request priority.
 *   **Release Stage:** ALPHA
 *   **Description:** Requests currently in flight on each endpoint (scheduled, not yet completed), as tracked by the in-flight load producer.
 *   **Usage:** Per-replica queue depth for load-aware routing and capacity analysis.
@@ -359,8 +357,6 @@ per-endpoint gauges are updated as requests are admitted and released.
     *   `endpoint_name`: string — the target endpoint (pod) name.
     *   `namespace`: string — the endpoint's namespace.
     *   `producer_name`: string — the configured `InFlightLoadProducer` instance name.
-    *   `fairness_id`: string — the flow-control fairness queue identity.
-    *   `priority`: string — the request priority.
 *   **Release Stage:** ALPHA
 *   **Description:** Tokens currently in flight on each endpoint — uncached prompt tokens, optionally plus estimated output tokens when the producer's `addEstimatedOutputTokens` is set.
 *   **Usage:** Per-replica token pressure, a finer load signal than request count when request sizes vary widely.

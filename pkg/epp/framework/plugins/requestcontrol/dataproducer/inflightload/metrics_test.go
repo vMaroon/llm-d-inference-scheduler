@@ -68,13 +68,13 @@ func TestInflightGauges_Lifecycle(t *testing.T) {
 		expectedRequests := fmt.Sprintf(`
 # HELP llm_d_epp_inflight_requests [ALPHA] Current number of in-flight requests per endpoint, as tracked by the in-flight load producer.
 # TYPE llm_d_epp_inflight_requests gauge
-llm_d_epp_inflight_requests{endpoint_name="ep1",fairness_id="",namespace="default",priority="0",producer_name="inflight-load-producer"} %d
+llm_d_epp_inflight_requests{endpoint_name="ep1",namespace="default",producer_name="inflight-load-producer"} %d
 `, requests)
 		require.NoError(t, promtestutil.CollectAndCompare(inflightRequests, strings.NewReader(expectedRequests), "llm_d_epp_inflight_requests"))
 		expectedTokens := fmt.Sprintf(`
 # HELP llm_d_epp_inflight_tokens [ALPHA] Current number of in-flight tokens per endpoint (uncached prompt tokens, optionally plus estimated output), as tracked by the in-flight load producer.
 # TYPE llm_d_epp_inflight_tokens gauge
-llm_d_epp_inflight_tokens{endpoint_name="ep1",fairness_id="",namespace="default",priority="0",producer_name="inflight-load-producer"} %d
+llm_d_epp_inflight_tokens{endpoint_name="ep1",namespace="default",producer_name="inflight-load-producer"} %d
 `, tokens)
 		require.NoError(t, promtestutil.CollectAndCompare(inflightTokens, strings.NewReader(expectedTokens), "llm_d_epp_inflight_tokens"))
 	}
@@ -98,44 +98,24 @@ llm_d_epp_inflight_tokens{endpoint_name="ep1",fairness_id="",namespace="default"
 	require.Equal(t, int64(0), producer.GetTokens(fullEndpointName("ep1")))
 }
 
-func TestInflightGauges_CustomFairnessAndPriority(t *testing.T) {
+func TestInflightGauges_RequestLabelsDoNotIncreaseCardinality(t *testing.T) {
 	inflightRequests.Reset()
 	inflightTokens.Reset()
 	producer := newTestProducer(t)
 	ctx := context.Background()
 
-	req := makeTokenRequest("req-fairness-prio", 4)
-	req.FairnessID = "custom-tenant"
-	req.Objectives.Priority = 3
-	res := makeSchedulingResult("ep1")
+	for i := range 100 {
+		req := makeTokenRequest(fmt.Sprintf("req-cardinality-%d", i), 4)
+		req.FairnessID = fmt.Sprintf("tenant-%d", i)
+		res := makeSchedulingResult("ep1")
+		require.NoError(t, producer.PreRequest(ctx, req, res))
 
-	err := producer.PreRequest(ctx, req, res)
-	require.NoError(t, err)
+		req.SchedulingResult = res
+		producer.ResponseBody(ctx, req, &requestcontrol.Response{EndOfStream: true}, nil)
+	}
 
-	expectedRequests := `
-# HELP llm_d_epp_inflight_requests [ALPHA] Current number of in-flight requests per endpoint, as tracked by the in-flight load producer.
-# TYPE llm_d_epp_inflight_requests gauge
-llm_d_epp_inflight_requests{endpoint_name="ep1",fairness_id="custom-tenant",namespace="default",priority="3",producer_name="inflight-load-producer"} 1
-`
-	require.NoError(t, promtestutil.CollectAndCompare(inflightRequests, strings.NewReader(expectedRequests), "llm_d_epp_inflight_requests"))
-
-	expectedTokens := `
-# HELP llm_d_epp_inflight_tokens [ALPHA] Current number of in-flight tokens per endpoint (uncached prompt tokens, optionally plus estimated output), as tracked by the in-flight load producer.
-# TYPE llm_d_epp_inflight_tokens gauge
-llm_d_epp_inflight_tokens{endpoint_name="ep1",fairness_id="custom-tenant",namespace="default",priority="3",producer_name="inflight-load-producer"} 10
-`
-	require.NoError(t, promtestutil.CollectAndCompare(inflightTokens, strings.NewReader(expectedTokens), "llm_d_epp_inflight_tokens"))
-
-	// Cleanup on completion
-	req.SchedulingResult = res
-	producer.ResponseBody(ctx, req, &requestcontrol.Response{EndOfStream: true}, nil)
-
-	expectedRequestsZero := `
-# HELP llm_d_epp_inflight_requests [ALPHA] Current number of in-flight requests per endpoint, as tracked by the in-flight load producer.
-# TYPE llm_d_epp_inflight_requests gauge
-llm_d_epp_inflight_requests{endpoint_name="ep1",fairness_id="custom-tenant",namespace="default",priority="3",producer_name="inflight-load-producer"} 0
-`
-	require.NoError(t, promtestutil.CollectAndCompare(inflightRequests, strings.NewReader(expectedRequestsZero), "llm_d_epp_inflight_requests"))
+	require.Equal(t, 1, promtestutil.CollectAndCount(inflightRequests))
+	require.Equal(t, 1, promtestutil.CollectAndCount(inflightTokens))
 }
 
 func TestInflightGauges_EarlyTokenRelease(t *testing.T) {
@@ -155,14 +135,14 @@ func TestInflightGauges_EarlyTokenRelease(t *testing.T) {
 	expectedRequests := `
 # HELP llm_d_epp_inflight_requests [ALPHA] Current number of in-flight requests per endpoint, as tracked by the in-flight load producer.
 # TYPE llm_d_epp_inflight_requests gauge
-llm_d_epp_inflight_requests{endpoint_name="ep1",fairness_id="",namespace="default",priority="0",producer_name="inflight-load-producer"} 1
+llm_d_epp_inflight_requests{endpoint_name="ep1",namespace="default",producer_name="inflight-load-producer"} 1
 `
 	require.NoError(t, promtestutil.CollectAndCompare(inflightRequests, strings.NewReader(expectedRequests), "llm_d_epp_inflight_requests"))
 
 	expectedTokens := `
 # HELP llm_d_epp_inflight_tokens [ALPHA] Current number of in-flight tokens per endpoint (uncached prompt tokens, optionally plus estimated output), as tracked by the in-flight load producer.
 # TYPE llm_d_epp_inflight_tokens gauge
-llm_d_epp_inflight_tokens{endpoint_name="ep1",fairness_id="",namespace="default",priority="0",producer_name="inflight-load-producer"} 4
+llm_d_epp_inflight_tokens{endpoint_name="ep1",namespace="default",producer_name="inflight-load-producer"} 4
 `
 	require.NoError(t, promtestutil.CollectAndCompare(inflightTokens, strings.NewReader(expectedTokens), "llm_d_epp_inflight_tokens"))
 
@@ -173,7 +153,7 @@ llm_d_epp_inflight_tokens{endpoint_name="ep1",fairness_id="",namespace="default"
 	expectedTokensReleased := `
 # HELP llm_d_epp_inflight_tokens [ALPHA] Current number of in-flight tokens per endpoint (uncached prompt tokens, optionally plus estimated output), as tracked by the in-flight load producer.
 # TYPE llm_d_epp_inflight_tokens gauge
-llm_d_epp_inflight_tokens{endpoint_name="ep1",fairness_id="",namespace="default",priority="0",producer_name="inflight-load-producer"} 0
+llm_d_epp_inflight_tokens{endpoint_name="ep1",namespace="default",producer_name="inflight-load-producer"} 0
 `
 	require.NoError(t, promtestutil.CollectAndCompare(inflightTokens, strings.NewReader(expectedTokensReleased), "llm_d_epp_inflight_tokens"))
 	require.NoError(t, promtestutil.CollectAndCompare(inflightRequests, strings.NewReader(expectedRequests), "llm_d_epp_inflight_requests"))
@@ -184,7 +164,7 @@ llm_d_epp_inflight_tokens{endpoint_name="ep1",fairness_id="",namespace="default"
 	expectedRequestsReleased := `
 # HELP llm_d_epp_inflight_requests [ALPHA] Current number of in-flight requests per endpoint, as tracked by the in-flight load producer.
 # TYPE llm_d_epp_inflight_requests gauge
-llm_d_epp_inflight_requests{endpoint_name="ep1",fairness_id="",namespace="default",priority="0",producer_name="inflight-load-producer"} 0
+llm_d_epp_inflight_requests{endpoint_name="ep1",namespace="default",producer_name="inflight-load-producer"} 0
 `
 	require.NoError(t, promtestutil.CollectAndCompare(inflightRequests, strings.NewReader(expectedRequestsReleased), "llm_d_epp_inflight_requests"))
 }
@@ -212,8 +192,8 @@ func TestInflightGauges_DisaggEarlyPrefillRelease(t *testing.T) {
 	expectedRequestsBoth := `
 # HELP llm_d_epp_inflight_requests [ALPHA] Current number of in-flight requests per endpoint, as tracked by the in-flight load producer.
 # TYPE llm_d_epp_inflight_requests gauge
-llm_d_epp_inflight_requests{endpoint_name="pod-a",fairness_id="",namespace="default",priority="0",producer_name="inflight-load-producer"} 1
-llm_d_epp_inflight_requests{endpoint_name="pod-b",fairness_id="",namespace="default",priority="0",producer_name="inflight-load-producer"} 1
+llm_d_epp_inflight_requests{endpoint_name="pod-a",namespace="default",producer_name="inflight-load-producer"} 1
+llm_d_epp_inflight_requests{endpoint_name="pod-b",namespace="default",producer_name="inflight-load-producer"} 1
 `
 	require.NoError(t, promtestutil.CollectAndCompare(inflightRequests, strings.NewReader(expectedRequestsBoth), "llm_d_epp_inflight_requests"))
 
@@ -224,8 +204,8 @@ llm_d_epp_inflight_requests{endpoint_name="pod-b",fairness_id="",namespace="defa
 	expectedRequestsPrefillReleased := `
 # HELP llm_d_epp_inflight_requests [ALPHA] Current number of in-flight requests per endpoint, as tracked by the in-flight load producer.
 # TYPE llm_d_epp_inflight_requests gauge
-llm_d_epp_inflight_requests{endpoint_name="pod-a",fairness_id="",namespace="default",priority="0",producer_name="inflight-load-producer"} 0
-llm_d_epp_inflight_requests{endpoint_name="pod-b",fairness_id="",namespace="default",priority="0",producer_name="inflight-load-producer"} 1
+llm_d_epp_inflight_requests{endpoint_name="pod-a",namespace="default",producer_name="inflight-load-producer"} 0
+llm_d_epp_inflight_requests{endpoint_name="pod-b",namespace="default",producer_name="inflight-load-producer"} 1
 `
 	require.NoError(t, promtestutil.CollectAndCompare(inflightRequests, strings.NewReader(expectedRequestsPrefillReleased), "llm_d_epp_inflight_requests"))
 
@@ -235,8 +215,8 @@ llm_d_epp_inflight_requests{endpoint_name="pod-b",fairness_id="",namespace="defa
 	expectedRequestsAllReleased := `
 # HELP llm_d_epp_inflight_requests [ALPHA] Current number of in-flight requests per endpoint, as tracked by the in-flight load producer.
 # TYPE llm_d_epp_inflight_requests gauge
-llm_d_epp_inflight_requests{endpoint_name="pod-a",fairness_id="",namespace="default",priority="0",producer_name="inflight-load-producer"} 0
-llm_d_epp_inflight_requests{endpoint_name="pod-b",fairness_id="",namespace="default",priority="0",producer_name="inflight-load-producer"} 0
+llm_d_epp_inflight_requests{endpoint_name="pod-a",namespace="default",producer_name="inflight-load-producer"} 0
+llm_d_epp_inflight_requests{endpoint_name="pod-b",namespace="default",producer_name="inflight-load-producer"} 0
 `
 	require.NoError(t, promtestutil.CollectAndCompare(inflightRequests, strings.NewReader(expectedRequestsAllReleased), "llm_d_epp_inflight_requests"))
 }
@@ -271,8 +251,8 @@ func TestInflightGauges_MultiProducer(t *testing.T) {
 	expectedRequests := `
 # HELP llm_d_epp_inflight_requests [ALPHA] Current number of in-flight requests per endpoint, as tracked by the in-flight load producer.
 # TYPE llm_d_epp_inflight_requests gauge
-llm_d_epp_inflight_requests{endpoint_name="ep1",fairness_id="flow-1",namespace="default",priority="1",producer_name="producer-1"} 1
-llm_d_epp_inflight_requests{endpoint_name="ep2",fairness_id="flow-2",namespace="default",priority="2",producer_name="producer-2"} 1
+llm_d_epp_inflight_requests{endpoint_name="ep1",namespace="default",producer_name="producer-1"} 1
+llm_d_epp_inflight_requests{endpoint_name="ep2",namespace="default",producer_name="producer-2"} 1
 `
 	require.NoError(t, promtestutil.CollectAndCompare(inflightRequests, strings.NewReader(expectedRequests), "llm_d_epp_inflight_requests"))
 
@@ -283,8 +263,8 @@ llm_d_epp_inflight_requests{endpoint_name="ep2",fairness_id="flow-2",namespace="
 	expectedRequestsAfterComplete := `
 # HELP llm_d_epp_inflight_requests [ALPHA] Current number of in-flight requests per endpoint, as tracked by the in-flight load producer.
 # TYPE llm_d_epp_inflight_requests gauge
-llm_d_epp_inflight_requests{endpoint_name="ep1",fairness_id="flow-1",namespace="default",priority="1",producer_name="producer-1"} 0
-llm_d_epp_inflight_requests{endpoint_name="ep2",fairness_id="flow-2",namespace="default",priority="2",producer_name="producer-2"} 1
+llm_d_epp_inflight_requests{endpoint_name="ep1",namespace="default",producer_name="producer-1"} 0
+llm_d_epp_inflight_requests{endpoint_name="ep2",namespace="default",producer_name="producer-2"} 1
 `
 	require.NoError(t, promtestutil.CollectAndCompare(inflightRequests, strings.NewReader(expectedRequestsAfterComplete), "llm_d_epp_inflight_requests"))
 }
@@ -297,8 +277,6 @@ func TestAddedTokensEntry_Clone(t *testing.T) {
 		endpointName: "ep1",
 		namespace:    "default",
 		producerName: "prod",
-		fairnessID:   "flow",
-		priority:     "1",
 	}
 	entry.tokens.Store(15)
 	entry.requests.Store(1)
@@ -307,8 +285,6 @@ func TestAddedTokensEntry_Clone(t *testing.T) {
 	require.Equal(t, entry.endpointName, cloned.endpointName)
 	require.Equal(t, entry.namespace, cloned.namespace)
 	require.Equal(t, entry.producerName, cloned.producerName)
-	require.Equal(t, entry.fairnessID, cloned.fairnessID)
-	require.Equal(t, entry.priority, cloned.priority)
 	require.Equal(t, int64(15), cloned.tokens.Load())
 	require.Equal(t, int32(1), cloned.requests.Load())
 }
