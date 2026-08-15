@@ -16,7 +16,7 @@ package kvblock
 
 import (
 	"context"
-	"fmt"
+	"errors"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -29,8 +29,6 @@ import (
 type tracedIndex struct {
 	next Index
 }
-
-var _ PrefixMatchLookup = &tracedIndex{}
 
 // NewTracedIndex wraps an Index and emits OpenTelemetry traces for index operations.
 // This encapsulates all tracing logic for the kvblock.Index interface.
@@ -105,37 +103,31 @@ func (t *tracedIndex) Lookup(
 		return nil, err
 	}
 
-	// Calculate cache hit metrics
-	blocksFound := 0
-	for _, pods := range result {
-		if len(pods) > 0 {
-			blocksFound++
-		}
-	}
-	cacheHit := blocksFound > 0
+	// Same ordered fold as the fused path, so blocks_found means the longest
+	// contiguous per-pod prefix chain on both.
+	blocksFound := maxContiguousPodHits(requestKeys, result)
 
 	span.SetAttributes(
-		attribute.Bool("llm_d.kv_cache.lookup.cache_hit", cacheHit),
+		attribute.Bool("llm_d.kv_cache.lookup.cache_hit", blocksFound > 0),
 		attribute.Int("llm_d.kv_cache.lookup.blocks_found", blocksFound),
 	)
 
 	return result, nil
 }
 
-func (t *tracedIndex) LookupPrefixMatches(
-	ctx context.Context,
-	requestKeys []BlockHash,
-	podIdentifierSet sets.Set[string],
-	mediumWeights map[string]float64,
-	speculativeTier string,
-) (map[string]PrefixMatch, error) {
-	next, ok := t.next.(PrefixMatchLookup)
+// ScoredLookup forwards the fused lookup capability with the same span
+// attribute schema as Lookup. Returns ErrScoredLookupUnsupported when the
+// wrapped backend lacks the capability.
+func (t *tracedIndex) ScoredLookup(ctx context.Context, requestKeys []BlockHash,
+	podIdentifierSet sets.Set[string], tierWeights map[string]float64,
+) (map[string]PodMatchStats, error) {
+	inner, ok := t.next.(ScoredLookupIndex)
 	if !ok {
-		return nil, fmt.Errorf("index %T does not support prefix-match lookup", t.next)
+		return nil, ErrScoredLookupUnsupported
 	}
 
 	tracer := tracing.Tracer("llm-d-router/pkg/kvcache/kvblock")
-	ctx, span := tracer.Start(ctx, "llm_d.kv_cache.index.prefix_match",
+	ctx, span := tracer.Start(ctx, "llm_d.kv_cache.index",
 		trace.WithSpanKind(trace.SpanKindInternal),
 	)
 	defer span.End()
@@ -145,15 +137,27 @@ func (t *tracedIndex) LookupPrefixMatches(
 		attribute.Int("llm_d.kv_cache.lookup.pod_filter_count", podIdentifierSet.Len()),
 	)
 
-	result, err := next.LookupPrefixMatches(
-		ctx, requestKeys, podIdentifierSet, mediumWeights, speculativeTier,
-	)
+	result, err := inner.ScoredLookup(ctx, requestKeys, podIdentifierSet, tierWeights)
 	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
+		// The unsupported sentinel is an expected signal that callers answer
+		// with the legacy Lookup path, not a failure.
+		if !errors.Is(err, ErrScoredLookupUnsupported) {
+			span.SetStatus(codes.Error, err.Error())
+		}
 		return nil, err
 	}
 
-	span.SetAttributes(attribute.Int("llm_d.kv_cache.lookup.matched_pod_count", len(result)))
+	blocksFound := 0
+	for _, stats := range result {
+		if stats.MatchedBlocks > blocksFound {
+			blocksFound = stats.MatchedBlocks
+		}
+	}
+	span.SetAttributes(
+		attribute.Bool("llm_d.kv_cache.lookup.cache_hit", blocksFound > 0),
+		attribute.Int("llm_d.kv_cache.lookup.blocks_found", blocksFound),
+	)
+
 	return result, nil
 }
 

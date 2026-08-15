@@ -16,7 +16,6 @@ package kvblock
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/llm-d/llm-d-router/pkg/kvcache/metrics"
 	"github.com/prometheus/client_golang/prometheus"
@@ -26,8 +25,6 @@ import (
 type instrumentedIndex struct {
 	next Index
 }
-
-var _ PrefixMatchLookup = &instrumentedIndex{}
 
 // NewInstrumentedIndex wraps an Index and emits metrics for Add, Evict, and
 // Lookup.
@@ -62,33 +59,44 @@ func (m *instrumentedIndex) Lookup(
 		return nil, err
 	}
 
-	go recordHitMetrics(pods)
+	// Synchronous: callers own requestKeys and the result map after return,
+	// so a deferred fold would race their reuse.
+	recordHitMetrics(requestKeys, pods)
 
 	return pods, nil
 }
 
-func (m *instrumentedIndex) LookupPrefixMatches(
-	ctx context.Context,
-	requestKeys []BlockHash,
-	podIdentifierSet sets.Set[string],
-	mediumWeights map[string]float64,
-	speculativeTier string,
-) (map[string]PrefixMatch, error) {
-	next, ok := m.next.(PrefixMatchLookup)
+// ScoredLookup forwards the fused lookup capability with the same request,
+// latency, and hit metrics as Lookup. Returns ErrScoredLookupUnsupported when
+// the wrapped backend lacks the capability.
+func (m *instrumentedIndex) ScoredLookup(ctx context.Context, requestKeys []BlockHash,
+	podIdentifierSet sets.Set[string], tierWeights map[string]float64,
+) (map[string]PodMatchStats, error) {
+	inner, ok := m.next.(ScoredLookupIndex)
 	if !ok {
-		return nil, fmt.Errorf("index %T does not support prefix-match lookup", m.next)
+		return nil, ErrScoredLookupUnsupported
 	}
 
 	timer := prometheus.NewTimer(metrics.LookupLatency)
 	defer timer.ObserveDuration()
+
 	metrics.LookupRequests.Inc()
 
-	matches, err := next.LookupPrefixMatches(ctx, requestKeys, podIdentifierSet, mediumWeights, speculativeTier)
+	result, err := inner.ScoredLookup(ctx, requestKeys, podIdentifierSet, tierWeights)
 	if err != nil {
 		return nil, err
 	}
-	go recordPrefixMatchMetrics(matches)
-	return matches, nil
+
+	maxHit := 0
+	for _, stats := range result {
+		if stats.MatchedBlocks > maxHit {
+			maxHit = stats.MatchedBlocks
+		}
+	}
+	metrics.MaxPodHitCount.Add(float64(maxHit))
+	metrics.LookupHits.Add(float64(maxHit))
+
+	return result, nil
 }
 
 func (m *instrumentedIndex) GetRequestKey(ctx context.Context, engineKey BlockHash) (BlockHash, error) {
@@ -99,36 +107,57 @@ func (m *instrumentedIndex) Clear(ctx context.Context, podIdentifier string) err
 	return m.next.Clear(ctx, podIdentifier)
 }
 
-func recordHitMetrics(keyToPods map[BlockHash][]PodEntry) {
-	podCount := make(map[string]int)
-	for _, pods := range keyToPods {
-		for _, p := range pods {
-			// First time seeing this pod in current lookup window.
-			// set to 1 because counts are local to this call (not cumulative over time).
-			// This ensures compatibility with sliding window attention (SWA) and cache eviction,
-			// where only recent hits within the active window are considered.
-			podCount[p.PodIdentifier]++
-		}
-	}
-
-	maxHit := 0
-	for _, count := range podCount {
-		if count > maxHit {
-			maxHit = count
-		}
-	}
-
+func recordHitMetrics(requestKeys []BlockHash, keyToPods map[BlockHash][]PodEntry) {
+	maxHit := maxContiguousPodHits(requestKeys, keyToPods)
 	metrics.MaxPodHitCount.Add(float64(maxHit))
 	metrics.LookupHits.Add(float64(maxHit))
 }
 
-func recordPrefixMatchMetrics(matches map[string]PrefixMatch) {
-	maxHit := 0
-	for _, match := range matches {
-		if match.CachedBlocks > maxHit {
-			maxHit = match.CachedBlocks
+// maxContiguousPodHits returns the longest contiguous prefix chain any single
+// pod holds, counting from the first request key - the same quantity the
+// fused ScoredLookup path reports as MatchedBlocks. One state map serves the
+// whole fold; a pod stays in the chain while its last-seen key is the
+// preceding one, and duplicate device tiers at a key count once.
+func maxContiguousPodHits(requestKeys []BlockHash, keyToPods map[BlockHash][]PodEntry) int {
+	if len(requestKeys) == 0 {
+		return 0
+	}
+	type podState struct {
+		lastKey int
+		count   int
+	}
+	state := make(map[string]podState, len(keyToPods[requestKeys[0]]))
+	best := 0
+	for i, key := range requestKeys {
+		entries := keyToPods[key]
+		if len(entries) == 0 {
+			break // no pod holds this key: every chain from key 0 ends here
+		}
+		advanced := false
+		for _, e := range entries {
+			s, ok := state[e.PodIdentifier]
+			switch {
+			case i == 0 && !ok:
+				state[e.PodIdentifier] = podState{lastKey: 0, count: 1}
+				advanced = true
+				if best == 0 {
+					best = 1
+				}
+			case ok && s.lastKey == i-1:
+				s.lastKey = i
+				s.count++
+				state[e.PodIdentifier] = s
+				advanced = true
+				if s.count > best {
+					best = s.count
+				}
+			default:
+				// Duplicate tier at this key, or a pod outside the chain.
+			}
+		}
+		if !advanced {
+			break // no chain advanced at this key; later keys cannot either
 		}
 	}
-	metrics.MaxPodHitCount.Add(float64(maxHit))
-	metrics.LookupHits.Add(float64(maxHit))
+	return best
 }
