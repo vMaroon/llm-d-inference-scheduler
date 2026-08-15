@@ -41,7 +41,7 @@ import (
 
 type fakeKVCacheIndexer struct {
 	computeFromTokens func(ctx context.Context, tokens []uint32, model string, extra []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error)
-	index             *fakeKVBlockIndex
+	index             kvblock.Index
 }
 
 func (f *fakeKVCacheIndexer) ComputeBlockKeysFromTokens(ctx context.Context, tokens []uint32, model string, extra []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
@@ -52,6 +52,27 @@ func (f *fakeKVCacheIndexer) ComputeBlockKeysFromTokens(ctx context.Context, tok
 }
 
 func (f *fakeKVCacheIndexer) KVBlockIndex() kvblock.Index { return f.index }
+
+type fakePrefixMatchIndex struct {
+	*fakeKVBlockIndex
+	lookupPrefixMatches func(
+		ctx context.Context,
+		keys []kvblock.BlockHash,
+		podSet sets.Set[string],
+		mediumWeights map[string]float64,
+		speculativeTier string,
+	) (map[string]kvblock.PrefixMatch, error)
+}
+
+func (f *fakePrefixMatchIndex) LookupPrefixMatches(
+	ctx context.Context,
+	keys []kvblock.BlockHash,
+	podSet sets.Set[string],
+	mediumWeights map[string]float64,
+	speculativeTier string,
+) (map[string]kvblock.PrefixMatch, error) {
+	return f.lookupPrefixMatches(ctx, keys, podSet, mediumWeights, speculativeTier)
+}
 
 type fakeKVBlockIndex struct {
 	lookup  func(ctx context.Context, keys []kvblock.BlockHash, podSet sets.Set[string]) (map[kvblock.BlockHash][]kvblock.PodEntry, error)
@@ -205,6 +226,64 @@ func TestProduce_UsesTokenizedPrompt(t *testing.T) {
 	assert.Equal(t, 0, info2.MatchBlocks())
 	assert.Equal(t, 1, info2.TotalBlocks())
 	assert.Nil(t, info2.MM(), "text-only request must leave MM untracked")
+}
+
+func TestProduce_UsesPrefixMatchLookupFastPath(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	keys := []kvblock.BlockHash{1, 2, 3}
+	const addr = "10.0.0.1:8080"
+
+	index := &fakePrefixMatchIndex{
+		fakeKVBlockIndex: &fakeKVBlockIndex{
+			lookup: func(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string]) (map[kvblock.BlockHash][]kvblock.PodEntry, error) {
+				t.Fatal("legacy Lookup must not run when the index supports PrefixMatchLookup")
+				return nil, nil
+			},
+		},
+		lookupPrefixMatches: func(
+			_ context.Context,
+			gotKeys []kvblock.BlockHash,
+			podSet sets.Set[string],
+			mediumWeights map[string]float64,
+			speculativeTier string,
+		) (map[string]kvblock.PrefixMatch, error) {
+			assert.Equal(t, keys, gotKeys)
+			assert.True(t, podSet.Has(addr))
+			assert.Equal(t, map[string]float64{"gpu": 1, "cpu": 0.5}, mediumWeights)
+			assert.Equal(t, attrprefix.SpeculativeTierKey, speculativeTier)
+			return map[string]kvblock.PrefixMatch{
+				addr: {
+					Score:              2.5,
+					CachedBlocks:       3,
+					CachedBlocksByTier: map[string]int{"gpu": 2, "cpu": 1},
+				},
+			}, nil
+		},
+	}
+	idx := &fakeKVCacheIndexer{
+		computeFromTokens: func(_ context.Context, _ []uint32, _ string, _ []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
+			return keys, nil
+		},
+		index: index,
+	}
+	p := newProducerWithIndexer(ctx, idx, &kvcache.LongestPrefixScorer{
+		MediumWeights: map[string]float64{"gpu": 1, "cpu": 0.5},
+	})
+	endpoints := freshEndpoints()
+	req := &scheduling.InferenceRequest{
+		RequestID: "fast-path",
+		Body: &fwkrh.InferenceRequestBody{
+			TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{{1, 2, 3}}},
+		},
+	}
+
+	require.NoError(t, p.Produce(ctx, req, endpoints))
+	raw, ok := endpoints[0].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test"))
+	require.True(t, ok)
+	info := raw.(*attrprefix.PrefixCacheMatchInfo)
+	assert.Equal(t, 2, info.MatchBlocks())
+	assert.Equal(t, 3, info.CachedBlockCount())
+	assert.Equal(t, map[string]int{"gpu": 2, "cpu": 1}, info.CachedBlocksByTier())
 }
 
 // No tokens → no-op (no prompt-string fallback).

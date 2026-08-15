@@ -20,11 +20,10 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"sync"
 
 	"github.com/fxamacker/cbor/v2"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-
-	"github.com/llm-d/llm-d-router/pkg/common/collections"
 )
 
 // defaultBlockSize is the default number of tokens per block.
@@ -78,7 +77,8 @@ type TokenProcessor interface {
 // It mimics the chunkedTokenDatabase in the Python code.
 type chunkedTokenDatabase struct {
 	TokenProcessorConfig
-	encoder cbor.EncMode // cached CBOR encoder for interoperable encoding
+	encoder    cbor.EncMode // cached CBOR encoder for interoperable encoding
+	initHashes sync.Map     // model name -> canonical initial hash
 }
 
 var _ TokenProcessor = &chunkedTokenDatabase{}
@@ -130,7 +130,12 @@ func NewChunkedTokenDatabase(config *TokenProcessorConfig) (TokenProcessor, erro
 
 // getInitHash returns the initial hash for the given model name.
 func (db *chunkedTokenDatabase) getInitHash(modelName string) uint64 {
-	return db.hash(db.initHash, nil, modelName)
+	if cached, ok := db.initHashes.Load(modelName); ok {
+		return cached.(uint64)
+	}
+	computed := db.hash(db.initHash, nil, modelName)
+	actual, _ := db.initHashes.LoadOrStore(modelName, computed)
+	return actual.(uint64)
 }
 
 // hash computes the uint64 FNV-64a hash of the given parent, tokens,
@@ -144,6 +149,13 @@ func (db *chunkedTokenDatabase) getInitHash(modelName string) uint64 {
 // multi-modal content. Supported types: nil, int, string, map[string]interface{}.
 // Must be CBOR-serializable.
 func (db *chunkedTokenDatabase) hash(parent uint64, tokens []uint32, extra interface{}) uint64 {
+	// Text-only blocks are the overwhelmingly common path. Encode the same
+	// canonical CBOR bytes directly into FNV-64a instead of constructing an
+	// interface slice and allocating a CBOR buffer for every block.
+	if extra == nil {
+		return hashTextBlock(parent, tokens)
+	}
+
 	payload := []interface{}{parent, tokens, extra}
 
 	b, err := db.encoder.Marshal(payload)
@@ -157,43 +169,59 @@ func (db *chunkedTokenDatabase) hash(parent uint64, tokens []uint32, extra inter
 	return h.Sum64()
 }
 
-// prefixHashes returns a slice of uint64 hashes.
-// extraFeatures must be the same length as tokenChunks (callers guarantee this).
-func (db *chunkedTokenDatabase) prefixHashes(
-	parentHash uint64, tokenChunks [][]uint32, extraFeatures []*BlockExtraFeatures,
-) []uint64 {
-	prefix := parentHash
-	hashes := make([]uint64, len(tokenChunks))
-	for i, chunk := range tokenChunks {
-		var extra interface{}
-		if extraFeatures[i] != nil {
-			extra = extraFeatures[i].MMHashes
+const (
+	fnv64Offset = uint64(14695981039346656037)
+	fnv64Prime  = uint64(1099511628211)
+)
+
+func hashByte(sum uint64, value byte) uint64 {
+	return (sum ^ uint64(value)) * fnv64Prime
+}
+
+// hashCBORMajor writes one canonical CBOR unsigned value with the supplied
+// major-type prefix directly into the running FNV sum.
+func hashCBORMajor(sum uint64, major byte, value uint64) uint64 {
+	switch {
+	case value < 24:
+		return hashByte(sum, major|byte(value))
+	case value <= 0xff:
+		sum = hashByte(sum, major|24)
+		return hashByte(sum, byte(value))
+	case value <= 0xffff:
+		sum = hashByte(sum, major|25)
+		sum = hashByte(sum, byte(value>>8))
+		return hashByte(sum, byte(value))
+	case value <= 0xffffffff:
+		sum = hashByte(sum, major|26)
+		for shift := 24; shift >= 0; shift -= 8 {
+			sum = hashByte(sum, byte(value>>shift))
 		}
-		prefix = db.hash(prefix, chunk, extra)
-		hashes[i] = prefix
+		return sum
+	default:
+		sum = hashByte(sum, major|27)
+		for shift := 56; shift >= 0; shift -= 8 {
+			sum = hashByte(sum, byte(value>>shift))
+		}
+		return sum
 	}
-	return hashes
+}
+
+// hashTextBlock is byte-for-byte equivalent to canonical CBOR encoding of
+// [parent, tokens, nil] followed by FNV-64a. It changes only the implementation,
+// not the vLLM-compatible hash value.
+func hashTextBlock(parent uint64, tokens []uint32) uint64 {
+	sum := hashByte(fnv64Offset, 0x83) // fixed-size array of three values
+	sum = hashCBORMajor(sum, 0x00, parent)
+	sum = hashCBORMajor(sum, 0x80, uint64(len(tokens)))
+	for _, token := range tokens {
+		sum = hashCBORMajor(sum, 0x00, uint64(token))
+	}
+	return hashByte(sum, 0xf6) // nil extra features
 }
 
 // BlockSize returns the number of tokens per block.
 func (db *chunkedTokenDatabase) BlockSize() int {
 	return db.BlockSizeTokens
-}
-
-// chunkTokens splits the input slice of tokens into chunks of size blockSize.
-func (db *chunkedTokenDatabase) chunkTokens(tokens []uint32) [][]uint32 {
-	bs := db.BlockSizeTokens
-	var chunks [][]uint32
-	for i := 0; i < len(tokens); i += bs {
-		end := i + bs
-		if end > len(tokens) {
-			break // no partial blocks
-		}
-
-		chunks = append(chunks, tokens[i:end])
-	}
-
-	return chunks
 }
 
 // TokensToKVBlockKeys converts tokens into kv_block.Keys.
@@ -208,21 +236,26 @@ func (db *chunkedTokenDatabase) TokensToKVBlockKeys(
 		currentParentHash = db.getInitHash(modelName)
 	}
 
-	chunks := db.chunkTokens(tokens)
-	if len(chunks) == 0 {
+	blockCount := len(tokens) / db.BlockSizeTokens
+	if blockCount == 0 {
 		return nil, nil
 	}
 
-	if extraFeatures == nil {
-		extraFeatures = make([]*BlockExtraFeatures, len(chunks))
-	} else if len(extraFeatures) != len(chunks) {
+	if extraFeatures != nil && len(extraFeatures) != blockCount {
 		return nil, fmt.Errorf("extraFeatures length %d does not match token chunk count %d (blockSizeTokens=%d, tokens=%d)",
-			len(extraFeatures), len(chunks), db.BlockSizeTokens, len(tokens))
+			len(extraFeatures), blockCount, db.BlockSizeTokens, len(tokens))
 	}
 
-	ph := db.prefixHashes(currentParentHash, chunks, extraFeatures)
-
-	return collections.SliceMap(ph, func(hashVal uint64) BlockHash {
-		return BlockHash(hashVal)
-	}), nil
+	keys := make([]BlockHash, blockCount)
+	for i := range blockCount {
+		start := i * db.BlockSizeTokens
+		end := start + db.BlockSizeTokens
+		var extra any
+		if extraFeatures != nil && extraFeatures[i] != nil {
+			extra = extraFeatures[i].MMHashes
+		}
+		currentParentHash = db.hash(currentParentHash, tokens[start:end], extra)
+		keys[i] = BlockHash(currentParentHash)
+	}
+	return keys, nil
 }

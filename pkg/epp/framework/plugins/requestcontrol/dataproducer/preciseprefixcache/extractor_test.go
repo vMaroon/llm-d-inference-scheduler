@@ -25,6 +25,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/kvevents"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/labels"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -102,6 +103,34 @@ func TestProducer_ExtractEndpoint_AddAndDelete(t *testing.T) {
 	}))
 	ids, _ = p.subscribersManager.GetActiveSubscribers()
 	assert.Empty(t, ids)
+}
+
+func TestProducer_ExtractEndpoint_AppliesPodLabelSelector(t *testing.T) {
+	ctx := discardCtx(t)
+	p := newExtractorProducer(true)
+	p.podSelector = labels.SelectorFromSet(labels.Set{"llm-d.ai/role": "prefill"})
+	defer p.subscribersManager.Shutdown(ctx)
+
+	for _, tc := range []struct {
+		name string
+		role string
+	}{
+		{name: "prefill-rank-0", role: "prefill"},
+		{name: "decode-rank-0", role: "decode"},
+	} {
+		require.NoError(t, p.Extract(ctx, fwkdl.EndpointEvent{
+			Type: fwkdl.EventAddOrUpdate,
+			Endpoint: fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{
+				ID:      k8stypes.NamespacedName{Namespace: "ns", Name: tc.name},
+				Address: "10.0.0.1",
+				Port:    "8000",
+				Labels:  map[string]string{"llm-d.ai/role": tc.role},
+			}, nil),
+		}))
+	}
+
+	ids, _ := p.subscribersManager.GetActiveSubscribers()
+	assert.Equal(t, []string{"ns/prefill-rank-0"}, ids)
 }
 
 // DiscoverPods=false → global-socket mode, per-pod discovery off.
