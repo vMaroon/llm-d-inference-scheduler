@@ -284,10 +284,15 @@ func (m *CostAwareMemoryIndex) Lookup(ctx context.Context, requestKeys []BlockHa
 
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvblock.CostAwareMemoryIndex.Lookup")
 
-	podsPerKey := make(map[BlockHash][]PodEntry)
+	podsPerKey := make(map[BlockHash][]PodEntry, len(requestKeys))
 	highestHitIdx := 0
 
 	for idx, key := range requestKeys {
+		if idx&63 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		keyStr := key.String()
 		if pods, found := m.data.Get(keyStr); found { //nolint:nestif // TODO: can this be optimized?
 			if pods == nil || pods.Len() == 0 {
@@ -321,8 +326,10 @@ func (m *CostAwareMemoryIndex) Lookup(ctx context.Context, requestKeys []BlockHa
 		}
 	}
 
-	traceLogger.Info("lookup completed", "highest-hit-index", highestHitIdx,
-		"pods-per-key", podsPerKeyPrintHelper(podsPerKey))
+	if traceLogger.Enabled() {
+		traceLogger.Info("lookup completed", "highest-hit-index", highestHitIdx,
+			"pods-per-key", podsPerKeyPrintHelper(podsPerKey))
+	}
 
 	return podsPerKey, nil
 }

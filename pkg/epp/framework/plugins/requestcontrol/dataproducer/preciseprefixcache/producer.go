@@ -32,6 +32,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
@@ -97,6 +98,7 @@ type Producer struct {
 
 	subscribersManager subscriberManager
 	kvEventsConfig     *kvevents.Config
+	podSelector        labels.Selector
 
 	kvBlockScorer kvcache.KVBlockScorer
 
@@ -162,6 +164,18 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		config.TokenProcessorConfig = kvblock.DefaultTokenProcessorConfig()
 	}
 
+	podSelector := labels.Everything()
+	if config.KVEventsConfig != nil && config.KVEventsConfig.PodDiscoveryConfig != nil {
+		selectorText := config.KVEventsConfig.PodDiscoveryConfig.PodLabelSelector
+		if selectorText != "" {
+			var err error
+			podSelector, err = labels.Parse(selectorText)
+			if err != nil {
+				return nil, fmt.Errorf("invalid podLabelSelector %q: %w", selectorText, err)
+			}
+		}
+	}
+
 	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(config.TokenProcessorConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create token processor: %w", err)
@@ -208,6 +222,7 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		kvBlockScorer:      kvBlockScorer,
 		subscribersManager: subscribersManager,
 		kvEventsConfig:     config.KVEventsConfig,
+		podSelector:        podSelector,
 		dk:                 attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(name),
 		pluginState:        plugin.NewPluginState(ctx),
 		speculativeCache:   speculativeCache,
@@ -344,16 +359,41 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 	logger := log.FromContext(ctx).WithName(p.typedName.String())
 	endpointSet := extractEndpointSet(endpoints)
 
-	type promptLookup struct {
-		keys      []kvblock.BlockHash
-		keyToPods map[kvblock.BlockHash][]kvblock.PodEntry
-	}
-
 	aggregatedScores := make(map[string]float64)
+	aggregatedCachedBlocks := make(map[string]int)
+	aggregatedCachedBlocksByTier := make(map[string]map[string]int)
 	totalBlocks := 0
-	lookups := make([]promptLookup, 0, len(perPromptKeys))
+	index := p.kvCacheIndexer.KVBlockIndex()
+	fastLookup, hasFastLookup := index.(kvblock.PrefixMatchLookup)
+	longestPrefixScorer, hasLongestPrefixScorer := p.kvBlockScorer.(*kvcache.LongestPrefixScorer)
 	for _, blockKeys := range perPromptKeys {
-		keyToPods, err := p.kvCacheIndexer.KVBlockIndex().Lookup(ctx, blockKeys, endpointSet)
+		if hasFastLookup && hasLongestPrefixScorer {
+			matches, err := fastLookup.LookupPrefixMatches(
+				ctx,
+				blockKeys,
+				endpointSet,
+				longestPrefixScorer.MediumWeights,
+				attrprefix.SpeculativeTierKey,
+			)
+			if err != nil {
+				span.SetStatus(codes.Error, err.Error())
+				return fmt.Errorf("failed to lookup prefix matches: %w", err)
+			}
+			for pod, match := range matches {
+				aggregatedScores[pod] += match.Score
+				aggregatedCachedBlocks[pod] += match.CachedBlocks
+				if aggregatedCachedBlocksByTier[pod] == nil {
+					aggregatedCachedBlocksByTier[pod] = make(map[string]int, len(match.CachedBlocksByTier))
+				}
+				for tier, count := range match.CachedBlocksByTier {
+					aggregatedCachedBlocksByTier[pod][tier] += count
+				}
+			}
+			totalBlocks += len(blockKeys)
+			continue
+		}
+
+		keyToPods, err := index.Lookup(ctx, blockKeys, endpointSet)
 		if err != nil {
 			span.SetStatus(codes.Error, err.Error())
 			return fmt.Errorf("failed to lookup block keys: %w", err)
@@ -366,12 +406,26 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 		for pod, score := range scores {
 			aggregatedScores[pod] += score
 		}
+		cachedBlocks, cachedBlocksByTier := matchedBlockCountsByPod(blockKeys, keyToPods)
+		for pod, count := range cachedBlocks {
+			aggregatedCachedBlocks[pod] += count
+		}
+		for pod, countsByTier := range cachedBlocksByTier {
+			if aggregatedCachedBlocksByTier[pod] == nil {
+				aggregatedCachedBlocksByTier[pod] = make(map[string]int, len(countsByTier))
+			}
+			for tier, count := range countsByTier {
+				aggregatedCachedBlocksByTier[pod][tier] += count
+			}
+		}
 		totalBlocks += len(blockKeys)
-		lookups = append(lookups, promptLookup{keys: blockKeys, keyToPods: keyToPods})
 	}
 
 	maxMatch := 0
 	for _, ep := range endpoints {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		md := ep.GetMetadata()
 		if md == nil {
 			continue
@@ -381,19 +435,15 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 		if matchLen > maxMatch {
 			maxMatch = matchLen
 		}
-		cachedBlocks := 0
-		cachedBlocksByTier := map[string]int{}
-		for _, lu := range lookups {
-			cachedBlocks += matchedBlockCount(lu.keys, lu.keyToPods, addr)
-			for tier, count := range matchedBlockCountByTier(lu.keys, lu.keyToPods, addr) {
-				cachedBlocksByTier[tier] += count
-			}
+		cachedBlocksByTier := aggregatedCachedBlocksByTier[addr]
+		if cachedBlocksByTier == nil {
+			cachedBlocksByTier = map[string]int{}
 		}
 		info := attrprefix.NewPrefixCacheMatchInfo(matchLen, totalBlocks, p.blockSizeTokens).
-			WithCachedBlockCount(cachedBlocks).
+			WithCachedBlockCount(aggregatedCachedBlocks[addr]).
 			WithCachedBlocksByTier(cachedBlocksByTier)
 		if len(mmBlockIndices) > 0 {
-			info.WithMM(attrprefix.MMMatchInfo{MatchBlocks: countMMMatchedBlocks(mmBlockIndices, cachedBlocks)})
+			info.WithMM(attrprefix.MMMatchInfo{MatchBlocks: countMMMatchedBlocks(mmBlockIndices, aggregatedCachedBlocks[addr])})
 		}
 		ep.Put(p.dk, info)
 	}

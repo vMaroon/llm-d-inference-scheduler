@@ -17,13 +17,23 @@ limitations under the License.
 package kvblock_test
 
 import (
+	"context"
+	"fmt"
 	"testing"
 
+	"github.com/llm-d/llm-d-router/pkg/kvcache"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	. "github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
+)
+
+var (
+	benchmarkPodsPerKey map[BlockHash][]PodEntry
+	benchmarkMatches    map[string]PrefixMatch
+	benchmarkScores     map[string]float64
 )
 
 // createInMemoryIndexForTesting creates a new InMemoryIndex for testing.
@@ -40,6 +50,111 @@ func createInMemoryIndexForTesting(t *testing.T) Index {
 
 func TestInMemoryIndexBehavior(t *testing.T) {
 	testCommonIndexBehavior(t, createInMemoryIndexForTesting)
+}
+
+func TestInMemoryIndexLookupHonorsCancelledContext(t *testing.T) {
+	index := createInMemoryIndexForTesting(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := index.Lookup(ctx, []BlockHash{1}, nil)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestInMemoryIndexLookupPrefixMatches(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(t.Context())
+	index := createInMemoryIndexForTesting(t)
+	lookup, ok := index.(PrefixMatchLookup)
+	require.True(t, ok)
+
+	const (
+		podA = "10.0.0.1:8000"
+		podB = "10.0.0.2:8000"
+	)
+	keys := []BlockHash{1, 2, 3}
+	require.NoError(t, index.Add(ctx, nil, []BlockHash{keys[0]}, []PodEntry{
+		{PodIdentifier: podA, DeviceTier: "gpu"},
+		{PodIdentifier: podA, DeviceTier: "cpu"},
+		{PodIdentifier: podB, DeviceTier: "gpu"},
+	}))
+	require.NoError(t, index.Add(ctx, nil, []BlockHash{keys[1]}, []PodEntry{
+		{PodIdentifier: podA, DeviceTier: "gpu"},
+		{PodIdentifier: podB, DeviceTier: "cpu"},
+	}))
+	require.NoError(t, index.Add(ctx, nil, []BlockHash{keys[2]}, []PodEntry{
+		{PodIdentifier: podB, DeviceTier: "cpu"},
+	}))
+
+	matches, err := lookup.LookupPrefixMatches(ctx, keys, nil, map[string]float64{"gpu": 1, "cpu": 0.5}, "speculative")
+	require.NoError(t, err)
+	assert.Equal(t, map[string]PrefixMatch{
+		podA: {Score: 2, CachedBlocks: 2, CachedBlocksByTier: map[string]int{"gpu": 2, "cpu": 1}},
+		podB: {Score: 2, CachedBlocks: 3, CachedBlocksByTier: map[string]int{"gpu": 1}},
+	}, matches)
+
+	matches, err = lookup.LookupPrefixMatches(ctx, keys, sets.New(podA), map[string]float64{"gpu": 1, "cpu": 0.5}, "speculative")
+	require.NoError(t, err)
+	assert.Equal(t, map[string]PrefixMatch{
+		podA: {Score: 2, CachedBlocks: 2, CachedBlocksByTier: map[string]int{"gpu": 2, "cpu": 1}},
+	}, matches)
+}
+
+func BenchmarkInMemoryIndexPrefixMatches(b *testing.B) {
+	const (
+		blockCount = 1034
+		podCount   = 40
+		rankCount  = 8
+	)
+	ctx := context.Background()
+	cfg := DefaultInMemoryIndexConfig()
+	cfg.Size = blockCount + 1
+	cfg.PodCacheSize = podCount * rankCount
+	index, err := NewInMemoryIndex(cfg)
+	require.NoError(b, err)
+
+	keys := make([]BlockHash, blockCount)
+	entries := make([]PodEntry, 0, podCount*rankCount)
+	podSet := sets.New[string]()
+	for pod := range podCount {
+		podID := fmt.Sprintf("10.0.0.%d:8080", pod)
+		podSet.Insert(podID)
+		for rank := range rankCount {
+			entries = append(entries, PodEntry{
+				PodIdentifier: podID,
+				DeviceTier:    "gpu",
+				HasGroup:      true,
+				GroupIdx:      GroupID(rank),
+			})
+		}
+	}
+	for block := range blockCount {
+		key := BlockHash(block + 1)
+		keys[block] = key
+		require.NoError(b, index.Add(ctx, nil, []BlockHash{key}, entries))
+	}
+
+	scorer := &kvcache.LongestPrefixScorer{MediumWeights: map[string]float64{"gpu": 1}}
+	fastLookup := any(index).(PrefixMatchLookup)
+	b.ResetTimer()
+
+	b.Run("materialized-lookup-and-score", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			benchmarkPodsPerKey, err = index.Lookup(ctx, keys, podSet)
+			require.NoError(b, err)
+			benchmarkScores, err = scorer.Score(ctx, keys, benchmarkPodsPerKey)
+			require.NoError(b, err)
+		}
+	})
+	b.Run("streaming-prefix-match", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			benchmarkMatches, err = fastLookup.LookupPrefixMatches(
+				ctx, keys, podSet, scorer.MediumWeights, "speculative",
+			)
+			require.NoError(b, err)
+		}
+	})
 }
 
 func TestInMemoryIndexSize(t *testing.T) {

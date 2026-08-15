@@ -114,6 +114,44 @@ func TestProduce_CompletionsVLLMHTTPUsesRawPayload(t *testing.T) {
 	assert.Equal(t, testHTTPModel, sent["model"])
 }
 
+func TestProduce_MessagesVLLMHTTPUsesTypedWireBody(t *testing.T) {
+	srv, cap := httpFixture(t, nil, renderResponse{TokenIDs: []uint32{8, 9}})
+	defer srv.Close()
+
+	req := &scheduling.InferenceRequest{
+		Body: &fwkrh.InferenceRequestBody{
+			Messages: &fwkrh.MessagesRequest{
+				System: fwkrh.AnthropicContent{Raw: "Be helpful."},
+				Messages: []fwkrh.AnthropicMessage{{
+					Role:    "user",
+					Content: fwkrh.AnthropicContent{Raw: "Hi"},
+				}},
+				Tools: []any{map[string]any{"name": "read_file"}},
+			},
+		},
+	}
+
+	p := newTestPlugin(newHTTPRenderer(t, srv))
+	require.NoError(t, p.Produce(context.Background(), req, nil))
+	require.NotNil(t, req.Body.TokenizedPrompt)
+	assert.Equal(t, []uint32{8, 9}, req.Body.TokenizedPrompt.PerPromptTokens[0])
+
+	var sent map[string]any
+	require.NoError(t, json.Unmarshal(cap.chat, &sent))
+	assert.Equal(t, testHTTPModel, sent["model"])
+	assert.NotContains(t, sent, "system")
+	msgs, ok := sent["messages"].([]any)
+	require.True(t, ok)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "system", msgs[0].(map[string]any)["role"])
+	assert.Equal(t, "Be helpful.", msgs[0].(map[string]any)["content"])
+	assert.Equal(t, "user", msgs[1].(map[string]any)["role"])
+	assert.Equal(t, "Hi", msgs[1].(map[string]any)["content"])
+	tools, ok := sent["tools"].([]any)
+	require.True(t, ok)
+	require.Len(t, tools, 1)
+}
+
 // TestVLLMHTTPRenderer_RenderChat_Multimodal covers the chat endpoint: the raw
 // payload is forwarded directly and multimodal features are converted from wire
 // format to kvcache map shape.

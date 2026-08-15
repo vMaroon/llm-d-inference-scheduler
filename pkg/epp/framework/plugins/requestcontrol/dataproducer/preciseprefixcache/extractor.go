@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 
+	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
@@ -46,6 +47,12 @@ func (p *Producer) Extract(ctx context.Context, event fwkdl.EndpointEvent) error
 
 	switch event.Type {
 	case fwkdl.EventAddOrUpdate:
+		if p.podSelector != nil && !p.podSelector.Matches(labels.Set(meta.Labels)) {
+			p.subscribersManager.RemoveSubscriber(ctx, endpointKey)
+			logger.V(logging.DEBUG).Info("Skipping endpoint outside KV-events pod selector",
+				"endpoint", endpointKey, "selector", p.podSelector.String())
+			return nil
+		}
 		if err := p.ensureSubscriber(ctx, meta); err != nil {
 			return err
 		}

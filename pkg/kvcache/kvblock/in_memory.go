@@ -17,6 +17,7 @@ limitations under the License.
 package kvblock
 
 import (
+	"container/list"
 	"context"
 	"fmt"
 	"strings"
@@ -89,14 +90,173 @@ type InMemoryIndex struct {
 }
 
 var _ Index = &InMemoryIndex{}
+var _ PrefixMatchLookup = &InMemoryIndex{}
 
 // PodCache represents a cache for pod entries.
 type PodCache struct {
-	// cache is an LRU cache that maps PodEntry to their last access time.
-	// thread-safe.
-	cache *lru.Cache[PodEntry, struct{}]
+	cache *podLRU
 	// mu protects the cache from concurrent access during check-and-set operations.
 	mu sync.Mutex
+}
+
+// podLRU is the per-block LRU. Unlike the generic LRU used for block keys, it
+// exposes an allocation-free iterator so request-time aggregation does not
+// need either a Keys copy or a second retained map.
+type podLRU struct {
+	size  int
+	order *list.List
+	items map[PodEntry]*list.Element
+}
+
+func newPodLRU(size int) (*podLRU, error) {
+	if size <= 0 {
+		return nil, fmt.Errorf("must provide a positive size")
+	}
+	return &podLRU{size: size, order: list.New(), items: make(map[PodEntry]*list.Element)}, nil
+}
+
+func (c *podLRU) Add(entry PodEntry) {
+	if element, ok := c.items[entry]; ok {
+		c.order.MoveToFront(element)
+		return
+	}
+	c.items[entry] = c.order.PushFront(entry)
+	if c.order.Len() <= c.size {
+		return
+	}
+	oldest := c.order.Back()
+	delete(c.items, oldest.Value.(PodEntry))
+	c.order.Remove(oldest)
+}
+
+func (c *podLRU) Remove(entry PodEntry) {
+	element, ok := c.items[entry]
+	if !ok {
+		return
+	}
+	delete(c.items, entry)
+	c.order.Remove(element)
+}
+
+func (c *podLRU) Len() int { return c.order.Len() }
+
+func (c *podLRU) Keys() []PodEntry {
+	entries := make([]PodEntry, 0, c.order.Len())
+	c.Range(func(entry PodEntry) bool {
+		entries = append(entries, entry)
+		return true
+	})
+	return entries
+}
+
+func (c *podLRU) Range(yield func(PodEntry) bool) {
+	for element := c.order.Back(); element != nil; element = element.Prev() {
+		if !yield(element.Value.(PodEntry)) {
+			return
+		}
+	}
+}
+
+type prefixPodTier struct {
+	pod  string
+	tier string
+}
+
+// LookupPrefixMatches computes all candidate pods' weighted and unweighted
+// contiguous-prefix matches in one index traversal.
+func (m *InMemoryIndex) LookupPrefixMatches(
+	ctx context.Context,
+	requestKeys []BlockHash,
+	podIdentifierSet sets.Set[string],
+	mediumWeights map[string]float64,
+	speculativeTier string,
+) (map[string]PrefixMatch, error) {
+	if len(requestKeys) == 0 {
+		return nil, fmt.Errorf("no requestKeys provided for lookup")
+	}
+
+	matches := map[string]PrefixMatch{}
+	alivePods := map[string]struct{}{}
+	aliveTiers := map[prefixPodTier]struct{}{}
+	weightsAtKey := map[string]float64{}
+	tiersAtKey := map[prefixPodTier]struct{}{}
+
+	for keyIndex, requestKey := range requestKeys {
+		if keyIndex&63 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+
+		clear(weightsAtKey)
+		clear(tiersAtKey)
+		if pods, found := m.data.Get(requestKey); found && pods != nil {
+			pods.mu.Lock()
+			pods.cache.Range(func(entry PodEntry) bool {
+				if podIdentifierSet.Len() > 0 && !podIdentifierSet.Has(entry.PodIdentifier) {
+					return true
+				}
+				weight := 1.0
+				if configured, ok := mediumWeights[entry.DeviceTier]; ok {
+					weight = configured
+				}
+				if current, ok := weightsAtKey[entry.PodIdentifier]; !ok || weight > current {
+					weightsAtKey[entry.PodIdentifier] = weight
+				}
+				tier := entry.DeviceTier
+				if entry.Speculative {
+					tier = speculativeTier
+				}
+				tiersAtKey[prefixPodTier{pod: entry.PodIdentifier, tier: tier}] = struct{}{}
+				return true
+			})
+			pods.mu.Unlock()
+		}
+
+		if keyIndex == 0 {
+			for podID, weight := range weightsAtKey {
+				alivePods[podID] = struct{}{}
+				matches[podID] = PrefixMatch{
+					Score:              weight,
+					CachedBlocks:       1,
+					CachedBlocksByTier: map[string]int{},
+				}
+			}
+			for podTier := range tiersAtKey {
+				aliveTiers[podTier] = struct{}{}
+				match := matches[podTier.pod]
+				match.CachedBlocksByTier[podTier.tier] = 1
+				matches[podTier.pod] = match
+			}
+			if len(alivePods) == 0 {
+				break
+			}
+			continue
+		}
+
+		for podID := range alivePods {
+			if weight, ok := weightsAtKey[podID]; ok {
+				match := matches[podID]
+				match.Score += weight
+				match.CachedBlocks++
+				matches[podID] = match
+			} else {
+				delete(alivePods, podID)
+			}
+		}
+		for podTier := range aliveTiers {
+			if _, ok := tiersAtKey[podTier]; ok {
+				matches[podTier.pod].CachedBlocksByTier[podTier.tier]++
+			} else {
+				delete(aliveTiers, podTier)
+			}
+		}
+		if len(alivePods) == 0 {
+			break
+		}
+	}
+
+	return matches, nil
 }
 
 // Lookup receives a list of requestKeys and a set of pod identifiers,
@@ -116,27 +276,45 @@ func (m *InMemoryIndex) Lookup(ctx context.Context, requestKeys []BlockHash,
 
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvblock.InMemoryIndex.Lookup")
 
-	podsPerKey := make(map[BlockHash][]PodEntry)
+	podsPerKey := make(map[BlockHash][]PodEntry, len(requestKeys))
 	highestHitIdx := 0
 
 	for idx, requestKey := range requestKeys {
+		if idx&63 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		if pods, found := m.data.Get(requestKey); found { //nolint:nestif // TODO: can this be optimized?
-			if pods == nil || pods.cache.Len() == 0 {
+			if pods == nil {
+				traceLogger.Info("no pods found for key, cutting search", "key", requestKey)
+				return podsPerKey, nil // early stop since prefix-chain breaks here
+			}
+
+			pods.mu.Lock()
+			if pods.cache.Len() == 0 {
+				pods.mu.Unlock()
 				traceLogger.Info("no pods found for key, cutting search", "key", requestKey)
 				return podsPerKey, nil // early stop since prefix-chain breaks here
 			}
 
 			highestHitIdx = idx
 
+			entries := pods.cache.Keys()
+			pods.mu.Unlock()
 			if podIdentifierSet.Len() == 0 {
 				// If no pod identifiers are provided, return all pods
-				podsPerKey[requestKey] = pods.cache.Keys()
+				podsPerKey[requestKey] = entries
 			} else {
 				// Filter pods based on the provided pod identifiers
-				for _, pod := range pods.cache.Keys() {
+				filtered := make([]PodEntry, 0, min(len(entries), podIdentifierSet.Len()))
+				for _, pod := range entries {
 					if podIdentifierSet.Has(pod.PodIdentifier) {
-						podsPerKey[requestKey] = append(podsPerKey[requestKey], pod)
+						filtered = append(filtered, pod)
 					}
+				}
+				if len(filtered) > 0 {
+					podsPerKey[requestKey] = filtered
 				}
 			}
 		} else {
@@ -144,8 +322,10 @@ func (m *InMemoryIndex) Lookup(ctx context.Context, requestKeys []BlockHash,
 		}
 	}
 
-	traceLogger.Info("lookup completed", "highest-hit-index", highestHitIdx,
-		"pods-per-key", podsPerKeyPrintHelper(podsPerKey))
+	if traceLogger.Enabled() {
+		traceLogger.Info("lookup completed", "highest-hit-index", highestHitIdx,
+			"pods-per-key", podsPerKeyPrintHelper(podsPerKey))
+	}
 
 	return podsPerKey, nil
 }
@@ -188,14 +368,11 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 		//nolint:nestif // double-checked locking pattern
 		if !found {
 			// Create new cache
-			cache, err := lru.New[PodEntry, struct{}](m.podCacheSize)
+			cache, err := newPodLRU(m.podCacheSize)
 			if err != nil {
 				return fmt.Errorf("failed to create pod cache for key %s: %w", requestKey.String(), err)
 			}
-
-			newPodCache := &PodCache{
-				cache: cache,
-			}
+			newPodCache := &PodCache{cache: cache}
 
 			// Try to add, but use existing if another thread added it first
 			// This is a bounded retry (1) - not perfectly safe but for practical use-cases and scenarios
@@ -215,7 +392,7 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 
 		podCache.mu.Lock()
 		for _, entry := range entries {
-			podCache.cache.Add(entry, struct{}{})
+			podCache.cache.Add(entry)
 		}
 		podCache.mu.Unlock()
 
@@ -250,9 +427,14 @@ func (m *InMemoryIndex) Evict(ctx context.Context, key BlockHash, keyType KeyTyp
 		m.mu.Lock()
 		allEmpty := true
 		for _, rk := range rks {
-			if pc, found := m.data.Get(rk); found && pc != nil && pc.cache.Len() > 0 {
-				allEmpty = false
-				break
+			if pc, found := m.data.Get(rk); found && pc != nil {
+				pc.mu.Lock()
+				nonEmpty := pc.cache.Len() > 0
+				pc.mu.Unlock()
+				if nonEmpty {
+					allEmpty = false
+					break
+				}
 			}
 		}
 		if allEmpty {

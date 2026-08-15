@@ -18,6 +18,7 @@ package kvblock_test
 
 import (
 	"encoding/json"
+	"hash/fnv"
 	"sync"
 	"testing"
 
@@ -27,6 +28,68 @@ import (
 
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 )
+
+func referenceBlockHash(t *testing.T, enc cbor.EncMode, parent uint64, tokens []uint32, extra any) uint64 {
+	t.Helper()
+	payload, err := enc.Marshal([]any{parent, tokens, extra})
+	require.NoError(t, err)
+	h := fnv.New64a()
+	_, err = h.Write(payload)
+	require.NoError(t, err)
+	return h.Sum64()
+}
+
+func TestTokensToKVBlockKeys_TextMatchesCanonicalCBOR(t *testing.T) {
+	const (
+		blockSize = 16
+		seed      = "test-seed"
+		model     = "zai-org/GLM-5.2-FP8"
+	)
+	tokens := []uint32{
+		0, 1, 22, 23, 24, 25, 254, 255, 256, 257, 65534, 65535, 65536, 65537, 1 << 24, 1 << 31,
+		11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+	}
+	processor, err := kvblock.NewChunkedTokenDatabase(&kvblock.TokenProcessorConfig{
+		BlockSizeTokens: blockSize,
+		HashSeed:        seed,
+	})
+	require.NoError(t, err)
+
+	got, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, model, nil)
+	require.NoError(t, err)
+	require.Len(t, got, len(tokens)/blockSize)
+
+	enc, err := cbor.CanonicalEncOptions().EncMode()
+	require.NoError(t, err)
+	seedHash := fnv.New64a()
+	_, err = seedHash.Write([]byte(seed))
+	require.NoError(t, err)
+	parent := referenceBlockHash(t, enc, seedHash.Sum64(), nil, model)
+	for i := range got {
+		start := i * blockSize
+		parent = referenceBlockHash(t, enc, parent, tokens[start:start+blockSize], nil)
+		assert.Equal(t, kvblock.BlockHash(parent), got[i], "block %d", i)
+	}
+}
+
+func BenchmarkTokensToKVBlockKeys_Text62290(b *testing.B) {
+	const tokenCount = 62290
+	tokens := make([]uint32, tokenCount)
+	for i := range tokens {
+		tokens[i] = uint32(i % 150000) // #nosec G115 -- benchmark data is bounded
+	}
+	processor, err := kvblock.NewChunkedTokenDatabase(&kvblock.TokenProcessorConfig{BlockSizeTokens: 64})
+	require.NoError(b, err)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(tokens) * 4))
+	b.ResetTimer()
+	for range b.N {
+		_, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "zai-org/GLM-5.2-FP8", nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
 
 func TestNewChunkedTokenDatabase_Validation(t *testing.T) {
 	tests := []struct {

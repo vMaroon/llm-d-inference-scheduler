@@ -17,12 +17,24 @@ limitations under the License.
 package preciseprefixcache
 
 import (
+	"context"
+	"fmt"
 	"testing"
 
+	"github.com/llm-d/llm-d-router/pkg/kvcache"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
+)
+
+var (
+	benchmarkCounts       map[string]int
+	benchmarkCountsByTier map[string]map[string]int
+	benchmarkScores       map[string]float64
+	benchmarkMatches      map[string]kvblock.PrefixMatch
 )
 
 func TestMatchedBlockCount(t *testing.T) {
@@ -184,4 +196,163 @@ func TestMatchedBlockCountByTier(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMatchedBlockCountsByPod(t *testing.T) {
+	const (
+		podA = "10.0.0.1:8000"
+		podB = "10.0.0.2:8000"
+		podC = "10.0.0.3:8000"
+	)
+	keys := []kvblock.BlockHash{1, 2, 3, 4}
+	keyToPods := map[kvblock.BlockHash][]kvblock.PodEntry{
+		1: {
+			{PodIdentifier: podA, DeviceTier: "gpu"},
+			{PodIdentifier: podA, DeviceTier: "cpu"},
+			{PodIdentifier: podB, DeviceTier: "gpu"},
+			{PodIdentifier: podC, Speculative: true},
+		},
+		2: {
+			{PodIdentifier: podA, DeviceTier: "gpu"},
+			{PodIdentifier: podB, DeviceTier: "gpu"},
+			{PodIdentifier: podC, Speculative: true},
+		},
+		3: {
+			{PodIdentifier: podB, DeviceTier: "gpu"},
+			{PodIdentifier: podC, DeviceTier: "gpu"},
+		},
+		4: {
+			{PodIdentifier: podA, DeviceTier: "gpu"},
+			{PodIdentifier: podB, DeviceTier: "gpu"},
+		},
+	}
+
+	counts, countsByTier := matchedBlockCountsByPod(keys, keyToPods)
+
+	for _, podID := range []string{podA, podB, podC} {
+		wantCount, wantByTier := matchedBlockCounts(keys, keyToPods, podID)
+		assert.Equal(t, wantCount, counts[podID], "pod %q", podID)
+		assert.Equal(t, wantByTier, countsByTier[podID], "pod %q", podID)
+	}
+	assert.Equal(t, map[string]int{podA: 2, podB: 4, podC: 3}, counts)
+	assert.Equal(t, map[string]map[string]int{
+		podA: {"gpu": 2, "cpu": 1},
+		podB: {"gpu": 4},
+		podC: {attrprefix.SpeculativeTierKey: 2},
+	}, countsByTier)
+}
+
+func BenchmarkMatchedBlockCountsAllPods(b *testing.B) {
+	const (
+		blockCount = 1034
+		podCount   = 40
+		rankCount  = 8
+	)
+	keys := make([]kvblock.BlockHash, blockCount)
+	keyToPods := make(map[kvblock.BlockHash][]kvblock.PodEntry, blockCount)
+	podIDs := make([]string, podCount)
+	for pod := range podCount {
+		podIDs[pod] = fmt.Sprintf("10.0.0.%d:8080", pod)
+	}
+	for block := range blockCount {
+		key := kvblock.BlockHash(block + 1)
+		keys[block] = key
+		entries := make([]kvblock.PodEntry, 0, podCount*rankCount*2)
+		for _, podID := range podIDs {
+			for range rankCount {
+				entries = append(entries,
+					kvblock.PodEntry{PodIdentifier: podID, DeviceTier: "gpu"},
+					kvblock.PodEntry{PodIdentifier: podID, DeviceTier: "cpu"},
+				)
+			}
+		}
+		keyToPods[key] = entries
+	}
+
+	b.Run("per-endpoint", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			counts := make(map[string]int, podCount)
+			countsByTier := make(map[string]map[string]int, podCount)
+			for _, podID := range podIDs {
+				counts[podID], countsByTier[podID] = matchedBlockCounts(keys, keyToPods, podID)
+			}
+			benchmarkCounts = counts
+			benchmarkCountsByTier = countsByTier
+		}
+	})
+
+	b.Run("all-pods", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			benchmarkCounts, benchmarkCountsByTier = matchedBlockCountsByPod(keys, keyToPods)
+		}
+	})
+}
+
+func BenchmarkPrecisePrefixLookupPipeline(b *testing.B) {
+	const (
+		blockCount = 1034
+		podCount   = 40
+		rankCount  = 8
+	)
+	ctx := context.Background()
+	cfg := kvblock.DefaultInMemoryIndexConfig()
+	cfg.Size = blockCount + 1
+	cfg.PodCacheSize = podCount * rankCount
+	index, err := kvblock.NewInMemoryIndex(cfg)
+	require.NoError(b, err)
+
+	keys := make([]kvblock.BlockHash, blockCount)
+	entries := make([]kvblock.PodEntry, 0, podCount*rankCount)
+	podIDs := make([]string, podCount)
+	podSet := sets.New[string]()
+	for pod := range podCount {
+		podID := fmt.Sprintf("10.0.0.%d:8080", pod)
+		podIDs[pod] = podID
+		podSet.Insert(podID)
+		for rank := range rankCount {
+			entries = append(entries, kvblock.PodEntry{
+				PodIdentifier: podID,
+				DeviceTier:    "gpu",
+				HasGroup:      true,
+				GroupIdx:      kvblock.GroupID(rank),
+			})
+		}
+	}
+	for block := range blockCount {
+		key := kvblock.BlockHash(block + 1)
+		keys[block] = key
+		require.NoError(b, index.Add(ctx, nil, []kvblock.BlockHash{key}, entries))
+	}
+
+	scorer := &kvcache.LongestPrefixScorer{MediumWeights: map[string]float64{"gpu": 1}}
+	fastLookup := any(index).(kvblock.PrefixMatchLookup)
+	b.ResetTimer()
+
+	b.Run("materialized-lookup-score-and-endpoints", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			keyToPods, lookupErr := index.Lookup(ctx, keys, podSet)
+			require.NoError(b, lookupErr)
+			benchmarkScores, lookupErr = scorer.Score(ctx, keys, keyToPods)
+			require.NoError(b, lookupErr)
+			counts := make(map[string]int, podCount)
+			countsByTier := make(map[string]map[string]int, podCount)
+			for _, podID := range podIDs {
+				counts[podID], countsByTier[podID] = matchedBlockCounts(keys, keyToPods, podID)
+			}
+			benchmarkCounts = counts
+			benchmarkCountsByTier = countsByTier
+		}
+	})
+	b.Run("streaming-prefix-match", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			benchmarkMatches, err = fastLookup.LookupPrefixMatches(
+				ctx, keys, podSet, scorer.MediumWeights, attrprefix.SpeculativeTierKey,
+			)
+			require.NoError(b, err)
+		}
+	})
 }

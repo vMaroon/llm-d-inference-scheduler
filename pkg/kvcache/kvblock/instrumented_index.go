@@ -16,6 +16,7 @@ package kvblock
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/llm-d/llm-d-router/pkg/kvcache/metrics"
 	"github.com/prometheus/client_golang/prometheus"
@@ -25,6 +26,8 @@ import (
 type instrumentedIndex struct {
 	next Index
 }
+
+var _ PrefixMatchLookup = &instrumentedIndex{}
 
 // NewInstrumentedIndex wraps an Index and emits metrics for Add, Evict, and
 // Lookup.
@@ -64,6 +67,30 @@ func (m *instrumentedIndex) Lookup(
 	return pods, nil
 }
 
+func (m *instrumentedIndex) LookupPrefixMatches(
+	ctx context.Context,
+	requestKeys []BlockHash,
+	podIdentifierSet sets.Set[string],
+	mediumWeights map[string]float64,
+	speculativeTier string,
+) (map[string]PrefixMatch, error) {
+	next, ok := m.next.(PrefixMatchLookup)
+	if !ok {
+		return nil, fmt.Errorf("index %T does not support prefix-match lookup", m.next)
+	}
+
+	timer := prometheus.NewTimer(metrics.LookupLatency)
+	defer timer.ObserveDuration()
+	metrics.LookupRequests.Inc()
+
+	matches, err := next.LookupPrefixMatches(ctx, requestKeys, podIdentifierSet, mediumWeights, speculativeTier)
+	if err != nil {
+		return nil, err
+	}
+	go recordPrefixMatchMetrics(matches)
+	return matches, nil
+}
+
 func (m *instrumentedIndex) GetRequestKey(ctx context.Context, engineKey BlockHash) (BlockHash, error) {
 	return m.next.GetRequestKey(ctx, engineKey)
 }
@@ -91,6 +118,17 @@ func recordHitMetrics(keyToPods map[BlockHash][]PodEntry) {
 		}
 	}
 
+	metrics.MaxPodHitCount.Add(float64(maxHit))
+	metrics.LookupHits.Add(float64(maxHit))
+}
+
+func recordPrefixMatchMetrics(matches map[string]PrefixMatch) {
+	maxHit := 0
+	for _, match := range matches {
+		if match.CachedBlocks > maxHit {
+			maxHit = match.CachedBlocks
+		}
+	}
 	metrics.MaxPodHitCount.Add(float64(maxHit))
 	metrics.LookupHits.Add(float64(maxHit))
 }
