@@ -22,8 +22,10 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync/atomic"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/jellydator/ttlcache/v3"
 	"github.com/llm-d/llm-d-router/pkg/kvcache"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
@@ -32,7 +34,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
-	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
@@ -98,9 +100,11 @@ type Producer struct {
 
 	subscribersManager subscriberManager
 	kvEventsConfig     *kvevents.Config
-	podSelector        labels.Selector
 
 	kvBlockScorer kvcache.KVBlockScorer
+	// tierWeights mirrors the scorer's device-tier weights for the fused
+	// ScoredLookup path.
+	tierWeights map[string]float64
 
 	dk plugin.DataKey
 
@@ -111,6 +115,10 @@ type Producer struct {
 	speculativeEnabled bool
 
 	blockSizeTokens int
+
+	// scoredLookupOff latches after the index reports the fused path
+	// unsupported, so later requests skip the probe and its span.
+	scoredLookupOff atomic.Bool
 
 	// Plugin-lifetime, not request-scoped: SubscriberManager binds each
 	// subscriber's goroutine to the ctx passed at registration.
@@ -164,18 +172,6 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		config.TokenProcessorConfig = kvblock.DefaultTokenProcessorConfig()
 	}
 
-	podSelector := labels.Everything()
-	if config.KVEventsConfig != nil && config.KVEventsConfig.PodDiscoveryConfig != nil {
-		selectorText := config.KVEventsConfig.PodDiscoveryConfig.PodLabelSelector
-		if selectorText != "" {
-			var err error
-			podSelector, err = labels.Parse(selectorText)
-			if err != nil {
-				return nil, fmt.Errorf("invalid podLabelSelector %q: %w", selectorText, err)
-			}
-		}
-	}
-
 	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(config.TokenProcessorConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create token processor: %w", err)
@@ -194,6 +190,10 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 	kvBlockScorer, err := kvcache.NewKVBlockScorer(scorerConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create KVBlockScorer: %w", err)
+	}
+	tierWeights := map[string]float64{}
+	if lps, ok := kvBlockScorer.(*kvcache.LongestPrefixScorer); ok {
+		tierWeights = lps.MediumWeights
 	}
 
 	adapter, err := engineadapter.NewAdapter(config.KVEventsConfig.EngineType)
@@ -220,9 +220,9 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		typedName:          plugin.TypedName{Type: PluginType, Name: name},
 		kvCacheIndexer:     indexer,
 		kvBlockScorer:      kvBlockScorer,
+		tierWeights:        tierWeights,
 		subscribersManager: subscribersManager,
 		kvEventsConfig:     config.KVEventsConfig,
-		podSelector:        podSelector,
 		dk:                 attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(name),
 		pluginState:        plugin.NewPluginState(ctx),
 		speculativeCache:   speculativeCache,
@@ -359,41 +359,27 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 	logger := log.FromContext(ctx).WithName(p.typedName.String())
 	endpointSet := extractEndpointSet(endpoints)
 
-	aggregatedScores := make(map[string]float64)
-	aggregatedCachedBlocks := make(map[string]int)
-	aggregatedCachedBlocksByTier := make(map[string]map[string]int)
-	totalBlocks := 0
-	index := p.kvCacheIndexer.KVBlockIndex()
-	fastLookup, hasFastLookup := index.(kvblock.PrefixMatchLookup)
-	longestPrefixScorer, hasLongestPrefixScorer := p.kvBlockScorer.(*kvcache.LongestPrefixScorer)
-	for _, blockKeys := range perPromptKeys {
-		if hasFastLookup && hasLongestPrefixScorer {
-			matches, err := fastLookup.LookupPrefixMatches(
-				ctx,
-				blockKeys,
-				endpointSet,
-				longestPrefixScorer.MediumWeights,
-				attrprefix.SpeculativeTierKey,
-			)
-			if err != nil {
-				span.SetStatus(codes.Error, err.Error())
-				return fmt.Errorf("failed to lookup prefix matches: %w", err)
-			}
-			for pod, match := range matches {
-				aggregatedScores[pod] += match.Score
-				aggregatedCachedBlocks[pod] += match.CachedBlocks
-				if aggregatedCachedBlocksByTier[pod] == nil {
-					aggregatedCachedBlocksByTier[pod] = make(map[string]int, len(match.CachedBlocksByTier))
-				}
-				for tier, count := range match.CachedBlocksByTier {
-					aggregatedCachedBlocksByTier[pod][tier] += count
-				}
-			}
-			totalBlocks += len(blockKeys)
-			continue
+	// Fused fast path: one index walk yields the weighted score, contiguous
+	// block count, and per-tier counts per pod, without materializing the
+	// per-key pod entry map or re-walking it per endpoint.
+	if scoredIndex, ok := p.kvCacheIndexer.KVBlockIndex().(kvblock.ScoredLookupIndex); ok && !p.scoredLookupOff.Load() {
+		handled, err := p.produceFused(ctx, span, request, endpoints, perPromptKeys, mmBlockIndices,
+			scoredIndex, endpointSet, logger)
+		if handled || err != nil {
+			return err
 		}
+	}
 
-		keyToPods, err := index.Lookup(ctx, blockKeys, endpointSet)
+	type promptLookup struct {
+		keys      []kvblock.BlockHash
+		keyToPods map[kvblock.BlockHash][]kvblock.PodEntry
+	}
+
+	aggregatedScores := make(map[string]float64)
+	totalBlocks := 0
+	lookups := make([]promptLookup, 0, len(perPromptKeys))
+	for _, blockKeys := range perPromptKeys {
+		keyToPods, err := p.kvCacheIndexer.KVBlockIndex().Lookup(ctx, blockKeys, endpointSet)
 		if err != nil {
 			span.SetStatus(codes.Error, err.Error())
 			return fmt.Errorf("failed to lookup block keys: %w", err)
@@ -406,31 +392,12 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 		for pod, score := range scores {
 			aggregatedScores[pod] += score
 		}
-		cachedBlocks, cachedBlocksByTier := matchedBlockCountsByPod(blockKeys, keyToPods)
-		for pod, count := range cachedBlocks {
-			aggregatedCachedBlocks[pod] += count
-		}
-		for pod, countsByTier := range cachedBlocksByTier {
-			if aggregatedCachedBlocksByTier[pod] == nil {
-				aggregatedCachedBlocksByTier[pod] = make(map[string]int, len(countsByTier))
-			}
-			for tier, count := range countsByTier {
-				aggregatedCachedBlocksByTier[pod][tier] += count
-			}
-		}
 		totalBlocks += len(blockKeys)
+		lookups = append(lookups, promptLookup{keys: blockKeys, keyToPods: keyToPods})
 	}
 
-	type endpointResult struct {
-		endpoint scheduling.Endpoint
-		info     *attrprefix.PrefixCacheMatchInfo
-	}
-	results := make([]endpointResult, 0, len(endpoints))
 	maxMatch := 0
 	for _, ep := range endpoints {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
 		md := ep.GetMetadata()
 		if md == nil {
 			continue
@@ -440,27 +407,21 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 		if matchLen > maxMatch {
 			maxMatch = matchLen
 		}
-		cachedBlocksByTier := aggregatedCachedBlocksByTier[addr]
-		if cachedBlocksByTier == nil {
-			cachedBlocksByTier = map[string]int{}
+		cachedBlocks := 0
+		cachedBlocksByTier := map[string]int{}
+		for _, lu := range lookups {
+			cachedBlocks += matchedBlockCount(lu.keys, lu.keyToPods, addr)
+			for tier, count := range matchedBlockCountByTier(lu.keys, lu.keyToPods, addr) {
+				cachedBlocksByTier[tier] += count
+			}
 		}
 		info := attrprefix.NewPrefixCacheMatchInfo(matchLen, totalBlocks, p.blockSizeTokens).
-			WithCachedBlockCount(aggregatedCachedBlocks[addr]).
+			WithCachedBlockCount(cachedBlocks).
 			WithCachedBlocksByTier(cachedBlocksByTier)
 		if len(mmBlockIndices) > 0 {
-			info.WithMM(attrprefix.MMMatchInfo{MatchBlocks: countMMMatchedBlocks(mmBlockIndices, aggregatedCachedBlocks[addr])})
+			info.WithMM(attrprefix.MMMatchInfo{MatchBlocks: countMMMatchedBlocks(mmBlockIndices, cachedBlocks)})
 		}
-		results = append(results, endpointResult{endpoint: ep, info: info})
-	}
-
-	// Publish only after the full result is ready. A deadline must leave every
-	// endpoint without current-request affinity rather than biasing the picker
-	// toward whichever endpoints happened to be visited first.
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	for _, result := range results {
-		result.endpoint.Put(p.dk, result.info)
+		ep.Put(p.dk, info)
 	}
 
 	if p.speculativeEnabled {
@@ -476,4 +437,89 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 	logger.V(logging.TRACE).Info("Produce completed",
 		"blockKeys", totalBlocks, "scores", aggregatedScores)
 	return nil
+}
+
+// produceFused writes PrefixCacheMatchInfo for every candidate endpoint from
+// fused ScoredLookup results. Returns handled=false when the index backend
+// does not support scored lookups, in which case the caller falls back to
+// Lookup plus external scoring.
+func (p *Producer) produceFused(ctx context.Context, span trace.Span,
+	request *scheduling.InferenceRequest, endpoints []scheduling.Endpoint,
+	perPromptKeys [][]kvblock.BlockHash, mmBlockIndices []int,
+	scoredIndex kvblock.ScoredLookupIndex, endpointSet sets.Set[string], logger logr.Logger,
+) (handled bool, err error) {
+	type podAgg struct {
+		score  float64
+		blocks int
+		byTier map[string]int
+	}
+	agg := make(map[string]*podAgg)
+	totalBlocks := 0
+	for _, blockKeys := range perPromptKeys {
+		stats, err := scoredIndex.ScoredLookup(ctx, blockKeys, endpointSet, p.tierWeights)
+		if err != nil {
+			if errors.Is(err, kvblock.ErrScoredLookupUnsupported) {
+				p.scoredLookupOff.Store(true)
+				return false, nil
+			}
+			span.SetStatus(codes.Error, err.Error())
+			return true, fmt.Errorf("failed to lookup block keys: %w", err)
+		}
+		for pod, s := range stats {
+			a := agg[pod]
+			if a == nil {
+				a = &podAgg{byTier: map[string]int{}}
+				agg[pod] = a
+			}
+			a.score += s.WeightedScore
+			a.blocks += s.MatchedBlocks
+			for tier, count := range s.BlocksByTier {
+				a.byTier[tier] += count
+			}
+		}
+		totalBlocks += len(blockKeys)
+	}
+
+	maxMatch := 0
+	for _, ep := range endpoints {
+		md := ep.GetMetadata()
+		if md == nil {
+			continue
+		}
+		addr := fmt.Sprintf("%s:%s", md.Address, md.Port)
+		matchLen, cachedBlocks := 0, 0
+		byTier := map[string]int{}
+		if a := agg[addr]; a != nil {
+			matchLen, cachedBlocks, byTier = int(a.score), a.blocks, a.byTier
+		}
+		if matchLen > maxMatch {
+			maxMatch = matchLen
+		}
+		info := attrprefix.NewPrefixCacheMatchInfo(matchLen, totalBlocks, p.blockSizeTokens).
+			WithCachedBlockCount(cachedBlocks).
+			WithCachedBlocksByTier(byTier)
+		if len(mmBlockIndices) > 0 {
+			info.WithMM(attrprefix.MMMatchInfo{MatchBlocks: countMMMatchedBlocks(mmBlockIndices, cachedBlocks)})
+		}
+		ep.Put(p.dk, info)
+	}
+
+	if p.speculativeEnabled {
+		p.pluginState.Write(request.RequestID, blockKeysStateKey,
+			&blockKeysState{perPromptKeys: perPromptKeys})
+	}
+
+	span.SetAttributes(
+		attribute.Int("llm_d.epp.producer.total_blocks", totalBlocks),
+		attribute.Int("llm_d.epp.producer.max_match_blocks", maxMatch),
+	)
+
+	if v := logger.V(logging.TRACE); v.Enabled() {
+		scores := make(map[string]float64, len(agg))
+		for pod, a := range agg {
+			scores[pod] = a.score
+		}
+		v.Info("Produce completed", "blockKeys", totalBlocks, "scores", scores)
+	}
+	return true, nil
 }
