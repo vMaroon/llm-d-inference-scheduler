@@ -421,6 +421,11 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 		totalBlocks += len(blockKeys)
 	}
 
+	type endpointResult struct {
+		endpoint scheduling.Endpoint
+		info     *attrprefix.PrefixCacheMatchInfo
+	}
+	results := make([]endpointResult, 0, len(endpoints))
 	maxMatch := 0
 	for _, ep := range endpoints {
 		if err := ctx.Err(); err != nil {
@@ -445,7 +450,17 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 		if len(mmBlockIndices) > 0 {
 			info.WithMM(attrprefix.MMMatchInfo{MatchBlocks: countMMMatchedBlocks(mmBlockIndices, aggregatedCachedBlocks[addr])})
 		}
-		ep.Put(p.dk, info)
+		results = append(results, endpointResult{endpoint: ep, info: info})
+	}
+
+	// Publish only after the full result is ready. A deadline must leave every
+	// endpoint without current-request affinity rather than biasing the picker
+	// toward whichever endpoints happened to be visited first.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for _, result := range results {
+		result.endpoint.Put(p.dk, result.info)
 	}
 
 	if p.speculativeEnabled {

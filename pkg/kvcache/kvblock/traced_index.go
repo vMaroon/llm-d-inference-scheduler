@@ -16,6 +16,7 @@ package kvblock
 
 import (
 	"context"
+	"fmt"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -28,6 +29,8 @@ import (
 type tracedIndex struct {
 	next Index
 }
+
+var _ PrefixMatchLookup = &tracedIndex{}
 
 // NewTracedIndex wraps an Index and emits OpenTelemetry traces for index operations.
 // This encapsulates all tracing logic for the kvblock.Index interface.
@@ -116,6 +119,41 @@ func (t *tracedIndex) Lookup(
 		attribute.Int("llm_d.kv_cache.lookup.blocks_found", blocksFound),
 	)
 
+	return result, nil
+}
+
+func (t *tracedIndex) LookupPrefixMatches(
+	ctx context.Context,
+	requestKeys []BlockHash,
+	podIdentifierSet sets.Set[string],
+	mediumWeights map[string]float64,
+	speculativeTier string,
+) (map[string]PrefixMatch, error) {
+	next, ok := t.next.(PrefixMatchLookup)
+	if !ok {
+		return nil, fmt.Errorf("index %T does not support prefix-match lookup", t.next)
+	}
+
+	tracer := tracing.Tracer("llm-d-router/pkg/kvcache/kvblock")
+	ctx, span := tracer.Start(ctx, "llm_d.kv_cache.index.prefix_match",
+		trace.WithSpanKind(trace.SpanKindInternal),
+	)
+	defer span.End()
+
+	span.SetAttributes(
+		attribute.Int("llm_d.kv_cache.index.lookup.block_count", len(requestKeys)),
+		attribute.Int("llm_d.kv_cache.lookup.pod_filter_count", podIdentifierSet.Len()),
+	)
+
+	result, err := next.LookupPrefixMatches(
+		ctx, requestKeys, podIdentifierSet, mediumWeights, speculativeTier,
+	)
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		return nil, err
+	}
+
+	span.SetAttributes(attribute.Int("llm_d.kv_cache.lookup.matched_pod_count", len(result)))
 	return result, nil
 }
 

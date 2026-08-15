@@ -17,11 +17,11 @@ limitations under the License.
 package kvblock
 
 import (
-	"container/list"
 	"context"
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/go-logr/logr"
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -59,7 +59,12 @@ func NewInMemoryIndex(cfg *InMemoryIndexConfig) (*InMemoryIndex, error) {
 		cfg = DefaultInMemoryIndexConfig()
 	}
 
-	cache, err := lru.New[BlockHash, *PodCache](cfg.Size)
+	index := &InMemoryIndex{podCacheSize: cfg.PodCacheSize}
+	cache, err := lru.NewWithEvict(cfg.Size, func(key BlockHash, evicted *PodCache) {
+		if current, ok := index.routingData.Load(key); ok && current == evicted {
+			index.routingData.Delete(key)
+		}
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize in-memory index: %w", err)
 	}
@@ -69,11 +74,9 @@ func NewInMemoryIndex(cfg *InMemoryIndexConfig) (*InMemoryIndex, error) {
 		return nil, fmt.Errorf("failed to initialize in-memory engine key map: %w", err)
 	}
 
-	return &InMemoryIndex{
-		data:                cache,
-		engineToRequestKeys: engineToRequestKeys,
-		podCacheSize:        cfg.PodCacheSize,
-	}, nil
+	index.data = cache
+	index.engineToRequestKeys = engineToRequestKeys
+	return index, nil
 }
 
 // InMemoryIndex is an in-memory implementation of the Index interface.
@@ -83,6 +86,10 @@ type InMemoryIndex struct {
 	mu sync.Mutex
 	// data holds the mapping of requestKeys to sets of pod identifiers.
 	data *lru.Cache[BlockHash, *PodCache]
+	// routingData mirrors only requestKey -> PodCache pointers. Exact lookup is
+	// read-only and should not serialize every block through the global LRU
+	// mutex or promote cache recency. The LRU eviction callback removes mirrors.
+	routingData sync.Map
 	// engineToRequestKeys holds the mapping of engineKeys to requestKeys.
 	engineToRequestKeys *lru.Cache[BlockHash, []BlockHash]
 	// podCacheSize is the maximum number of pod entries per key.
@@ -97,64 +104,117 @@ type PodCache struct {
 	cache *podLRU
 	// mu protects the cache from concurrent access during check-and-set operations.
 	mu sync.Mutex
+	// routingSnapshot is an immutable pod/tier view built lazily for exact
+	// routing. Add and Remove invalidate it without retaining a second copy of
+	// every rank/group PodEntry in the full index.
+	routingSnapshot atomic.Pointer[podRoutingSnapshot]
 }
 
-// podLRU is the per-block LRU. Unlike the generic LRU used for block keys, it
-// exposes an allocation-free iterator so request-time aggregation does not
-// need either a Keys copy or a second retained map.
+type podRoute struct {
+	pod         string
+	deviceTier  string
+	speculative bool
+}
+
+type podRoutingSnapshot struct {
+	routes []podRoute
+}
+
+// podLRU is the per-block LRU. Most blocks have only a few entries, so a compact
+// oldest-to-newest slice uses substantially less live memory than a map plus
+// linked-list node per entry. Mutations are linear in this small local set;
+// request-time routing uses the immutable collapsed snapshot above it.
 type podLRU struct {
-	size  int
-	order *list.List
-	items map[PodEntry]*list.Element
+	size    int
+	entries []PodEntry
 }
 
 func newPodLRU(size int) (*podLRU, error) {
 	if size <= 0 {
 		return nil, fmt.Errorf("must provide a positive size")
 	}
-	return &podLRU{size: size, order: list.New(), items: make(map[PodEntry]*list.Element)}, nil
+	return &podLRU{size: size}, nil
 }
 
-func (c *podLRU) Add(entry PodEntry) {
-	if element, ok := c.items[entry]; ok {
-		c.order.MoveToFront(element)
-		return
+func (c *podLRU) Add(entry PodEntry) bool {
+	for i := range c.entries {
+		if c.entries[i] != entry {
+			continue
+		}
+		// Entries are oldest to newest. Refresh recency without allocating.
+		copy(c.entries[i:], c.entries[i+1:])
+		c.entries[len(c.entries)-1] = entry
+		return false
 	}
-	c.items[entry] = c.order.PushFront(entry)
-	if c.order.Len() <= c.size {
-		return
+	if len(c.entries) < c.size {
+		c.entries = append(c.entries, entry)
+		return true
 	}
-	oldest := c.order.Back()
-	delete(c.items, oldest.Value.(PodEntry))
-	c.order.Remove(oldest)
+	copy(c.entries, c.entries[1:])
+	c.entries[len(c.entries)-1] = entry
+	return true
 }
 
-func (c *podLRU) Remove(entry PodEntry) {
-	element, ok := c.items[entry]
-	if !ok {
-		return
+func (c *podLRU) Remove(entry PodEntry) bool {
+	for i := range c.entries {
+		if c.entries[i] != entry {
+			continue
+		}
+		copy(c.entries[i:], c.entries[i+1:])
+		c.entries[len(c.entries)-1] = PodEntry{}
+		c.entries = c.entries[:len(c.entries)-1]
+		return true
 	}
-	delete(c.items, entry)
-	c.order.Remove(element)
+	return false
 }
 
-func (c *podLRU) Len() int { return c.order.Len() }
+func (c *podLRU) Len() int { return len(c.entries) }
 
 func (c *podLRU) Keys() []PodEntry {
-	entries := make([]PodEntry, 0, c.order.Len())
-	c.Range(func(entry PodEntry) bool {
-		entries = append(entries, entry)
-		return true
-	})
+	entries := make([]PodEntry, len(c.entries))
+	copy(entries, c.entries)
 	return entries
 }
 
 func (c *podLRU) Range(yield func(PodEntry) bool) {
-	for element := c.order.Back(); element != nil; element = element.Prev() {
-		if !yield(element.Value.(PodEntry)) {
+	for _, entry := range c.entries {
+		if !yield(entry) {
 			return
 		}
 	}
+}
+
+// routes returns an immutable, rank/group-collapsed routing view. The full
+// PodEntry set remains authoritative for exact eviction and LRU capacity.
+func (c *PodCache) routes() []podRoute {
+	if snapshot := c.routingSnapshot.Load(); snapshot != nil {
+		return snapshot.routes
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if snapshot := c.routingSnapshot.Load(); snapshot != nil {
+		return snapshot.routes
+	}
+
+	deduplicated := make(map[podRoute]struct{}, c.cache.Len())
+	routes := make([]podRoute, 0, c.cache.Len())
+	c.cache.Range(func(entry PodEntry) bool {
+		route := podRoute{
+			pod:         entry.PodIdentifier,
+			deviceTier:  entry.DeviceTier,
+			speculative: entry.Speculative,
+		}
+		if _, exists := deduplicated[route]; exists {
+			return true
+		}
+		deduplicated[route] = struct{}{}
+		routes = append(routes, route)
+		return true
+	})
+	snapshot := &podRoutingSnapshot{routes: routes}
+	c.routingSnapshot.Store(snapshot)
+	return snapshot.routes
 }
 
 type prefixPodTier struct {
@@ -190,27 +250,25 @@ func (m *InMemoryIndex) LookupPrefixMatches(
 
 		clear(weightsAtKey)
 		clear(tiersAtKey)
-		if pods, found := m.data.Get(requestKey); found && pods != nil {
-			pods.mu.Lock()
-			pods.cache.Range(func(entry PodEntry) bool {
-				if podIdentifierSet.Len() > 0 && !podIdentifierSet.Has(entry.PodIdentifier) {
-					return true
+		if value, found := m.routingData.Load(requestKey); found {
+			pods := value.(*PodCache)
+			for _, route := range pods.routes() {
+				if podIdentifierSet.Len() > 0 && !podIdentifierSet.Has(route.pod) {
+					continue
 				}
 				weight := 1.0
-				if configured, ok := mediumWeights[entry.DeviceTier]; ok {
+				if configured, ok := mediumWeights[route.deviceTier]; ok {
 					weight = configured
 				}
-				if current, ok := weightsAtKey[entry.PodIdentifier]; !ok || weight > current {
-					weightsAtKey[entry.PodIdentifier] = weight
+				if current, ok := weightsAtKey[route.pod]; !ok || weight > current {
+					weightsAtKey[route.pod] = weight
 				}
-				tier := entry.DeviceTier
-				if entry.Speculative {
+				tier := route.deviceTier
+				if route.speculative {
 					tier = speculativeTier
 				}
-				tiersAtKey[prefixPodTier{pod: entry.PodIdentifier, tier: tier}] = struct{}{}
-				return true
-			})
-			pods.mu.Unlock()
+				tiersAtKey[prefixPodTier{pod: route.pod, tier: tier}] = struct{}{}
+			}
 		}
 
 		if keyIndex == 0 {
@@ -391,10 +449,15 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 		}
 
 		podCache.mu.Lock()
+		changed := false
 		for _, entry := range entries {
-			podCache.cache.Add(entry)
+			changed = podCache.cache.Add(entry) || changed
+		}
+		if changed {
+			podCache.routingSnapshot.Store(nil)
 		}
 		podCache.mu.Unlock()
+		m.routingData.Store(requestKey, podCache)
 
 		traceLogger.Info("added pods to key", "requestKey", requestKey, "pods", entries)
 	}
@@ -460,8 +523,12 @@ func (m *InMemoryIndex) evictPodsFromRequestKey(requestKey, engineKey BlockHash,
 	}
 
 	podCache.mu.Lock()
+	changed := false
 	for _, entry := range entries {
-		podCache.cache.Remove(entry)
+		changed = podCache.cache.Remove(entry) || changed
+	}
+	if changed {
+		podCache.routingSnapshot.Store(nil)
 	}
 
 	isEmpty := podCache.cache.Len() == 0
