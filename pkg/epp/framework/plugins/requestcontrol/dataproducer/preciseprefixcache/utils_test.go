@@ -328,6 +328,7 @@ func BenchmarkPrecisePrefixLookupPipeline(b *testing.B) {
 
 	scorer := &kvcache.LongestPrefixScorer{MediumWeights: map[string]float64{"gpu": 1}}
 	fastLookup := any(index).(kvblock.PrefixMatchLookup)
+	wrappedFastLookup := any(kvblock.NewTracedIndex(kvblock.NewInstrumentedIndex(index))).(kvblock.PrefixMatchLookup)
 	b.ResetTimer()
 
 	b.Run("materialized-lookup-score-and-endpoints", func(b *testing.B) {
@@ -350,6 +351,15 @@ func BenchmarkPrecisePrefixLookupPipeline(b *testing.B) {
 		b.ReportAllocs()
 		for range b.N {
 			benchmarkMatches, err = fastLookup.LookupPrefixMatches(
+				ctx, keys, podSet, scorer.MediumWeights, attrprefix.SpeculativeTierKey,
+			)
+			require.NoError(b, err)
+		}
+	})
+	b.Run("wrapped-streaming-prefix-match", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			benchmarkMatches, err = wrappedFastLookup.LookupPrefixMatches(
 				ctx, keys, podSet, scorer.MediumWeights, attrprefix.SpeculativeTierKey,
 			)
 			require.NoError(b, err)

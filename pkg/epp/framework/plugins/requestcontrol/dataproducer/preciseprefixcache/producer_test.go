@@ -522,6 +522,48 @@ func TestProduce_WritesCachedBlocksByTier(t *testing.T) {
 	assert.Empty(t, info.CachedBlocksByTier())
 }
 
+func TestProduce_DeadlinePublishesNoPartialEndpointResults(t *testing.T) {
+	baseCtx := utils.NewTestContext(t)
+	ctx, cancel := context.WithCancel(baseCtx)
+	endpoints := freshEndpoints()
+	key := kvblock.BlockHash(0xA1)
+
+	idx := &fakeKVCacheIndexer{
+		computeFromTokens: func(_ context.Context, _ []uint32, _ string, _ []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
+			return []kvblock.BlockHash{key}, nil
+		},
+		index: &fakeKVBlockIndex{
+			lookup: func(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string]) (map[kvblock.BlockHash][]kvblock.PodEntry, error) {
+				return map[kvblock.BlockHash][]kvblock.PodEntry{
+					key: {{PodIdentifier: "10.0.0.1:8080", DeviceTier: "gpu"}},
+				}, nil
+			},
+		},
+	}
+	scorer := &fakeKVBlockScorer{
+		score: func(_ context.Context, _ []kvblock.BlockHash, _ map[kvblock.BlockHash][]kvblock.PodEntry) (map[string]float64, error) {
+			cancel()
+			return map[string]float64{"10.0.0.1:8080": 1}, nil
+		},
+	}
+	p := newProducerWithIndexer(baseCtx, idx, scorer)
+	req := &scheduling.InferenceRequest{
+		RequestID:   "req-cancel-before-publish",
+		TargetModel: "test-model",
+		Body: &fwkrh.InferenceRequestBody{TokenizedPrompt: &fwkrh.TokenizedPrompt{
+			PerPromptTokens: [][]uint32{{1, 2, 3, 4}},
+		}},
+	}
+
+	err := p.Produce(ctx, req, endpoints)
+	require.ErrorIs(t, err, context.Canceled)
+	keyForProducer := attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test")
+	for _, endpoint := range endpoints {
+		_, found := endpoint.Get(keyForProducer)
+		assert.False(t, found, "deadline must not publish a subset of endpoint affinity results")
+	}
+}
+
 // MM match uses cachedBlocks (literal), not matchLen (tier-weighted score).
 func TestProduce_MMMatchUsesCachedBlocksNotWeightedScore(t *testing.T) {
 	ctx := utils.NewTestContext(t)
