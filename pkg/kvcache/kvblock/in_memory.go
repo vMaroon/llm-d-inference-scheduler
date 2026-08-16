@@ -257,7 +257,7 @@ func (m *InMemoryIndex) Lookup(ctx context.Context, requestKeys []BlockHash,
 		if idx&cancellationCheckMask == 0 && ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		pods, found := m.data.Get(requestKey)
+		pods, found := m.data.Peek(requestKey)
 		if !found {
 			if traceLogger.Enabled() {
 				traceLogger.Info("key not found in index", "key", requestKey)
