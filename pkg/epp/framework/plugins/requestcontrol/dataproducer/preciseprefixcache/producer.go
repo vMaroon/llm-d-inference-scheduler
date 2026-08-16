@@ -34,6 +34,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -100,6 +101,7 @@ type Producer struct {
 
 	subscribersManager subscriberManager
 	kvEventsConfig     *kvevents.Config
+	podSelector        labels.Selector
 
 	kvBlockScorer kvcache.KVBlockScorer
 	// tierWeights mirrors the scorer's device-tier weights for the fused
@@ -172,6 +174,18 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		config.TokenProcessorConfig = kvblock.DefaultTokenProcessorConfig()
 	}
 
+	podSelector := labels.Everything()
+	if config.KVEventsConfig != nil && config.KVEventsConfig.PodDiscoveryConfig != nil {
+		selectorText := config.KVEventsConfig.PodDiscoveryConfig.PodLabelSelector
+		if selectorText != "" {
+			var err error
+			podSelector, err = labels.Parse(selectorText)
+			if err != nil {
+				return nil, fmt.Errorf("invalid podLabelSelector %q: %w", selectorText, err)
+			}
+		}
+	}
+
 	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(config.TokenProcessorConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create token processor: %w", err)
@@ -223,6 +237,7 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		tierWeights:        tierWeights,
 		subscribersManager: subscribersManager,
 		kvEventsConfig:     config.KVEventsConfig,
+		podSelector:        podSelector,
 		dk:                 attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(name),
 		pluginState:        plugin.NewPluginState(ctx),
 		speculativeCache:   speculativeCache,

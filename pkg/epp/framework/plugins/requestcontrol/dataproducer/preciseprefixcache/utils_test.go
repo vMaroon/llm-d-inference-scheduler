@@ -34,7 +34,7 @@ var (
 	benchmarkCounts       map[string]int
 	benchmarkCountsByTier map[string]map[string]int
 	benchmarkScores       map[string]float64
-	benchmarkMatches      map[string]kvblock.PrefixMatch
+	benchmarkScoredStats  map[string]kvblock.PodMatchStats
 )
 
 func TestMatchedBlockCount(t *testing.T) {
@@ -327,8 +327,8 @@ func BenchmarkPrecisePrefixLookupPipeline(b *testing.B) {
 	}
 
 	scorer := &kvcache.LongestPrefixScorer{MediumWeights: map[string]float64{"gpu": 1}}
-	fastLookup := any(index).(kvblock.PrefixMatchLookup)
-	wrappedFastLookup := any(kvblock.NewTracedIndex(kvblock.NewInstrumentedIndex(index))).(kvblock.PrefixMatchLookup)
+	scoredLookup := any(index).(kvblock.ScoredLookupIndex)
+	wrappedScoredLookup := any(kvblock.NewTracedIndex(kvblock.NewInstrumentedIndex(index))).(kvblock.ScoredLookupIndex)
 	b.ResetTimer()
 
 	b.Run("materialized-lookup-score-and-endpoints", func(b *testing.B) {
@@ -347,21 +347,17 @@ func BenchmarkPrecisePrefixLookupPipeline(b *testing.B) {
 			benchmarkCountsByTier = countsByTier
 		}
 	})
-	b.Run("streaming-prefix-match", func(b *testing.B) {
+	b.Run("scored-lookup", func(b *testing.B) {
 		b.ReportAllocs()
 		for range b.N {
-			benchmarkMatches, err = fastLookup.LookupPrefixMatches(
-				ctx, keys, podSet, scorer.MediumWeights, attrprefix.SpeculativeTierKey,
-			)
+			benchmarkScoredStats, err = scoredLookup.ScoredLookup(ctx, keys, podSet, scorer.MediumWeights)
 			require.NoError(b, err)
 		}
 	})
-	b.Run("wrapped-streaming-prefix-match", func(b *testing.B) {
+	b.Run("wrapped-scored-lookup", func(b *testing.B) {
 		b.ReportAllocs()
 		for range b.N {
-			benchmarkMatches, err = wrappedFastLookup.LookupPrefixMatches(
-				ctx, keys, podSet, scorer.MediumWeights, attrprefix.SpeculativeTierKey,
-			)
+			benchmarkScoredStats, err = wrappedScoredLookup.ScoredLookup(ctx, keys, podSet, scorer.MediumWeights)
 			require.NoError(b, err)
 		}
 	})

@@ -19,6 +19,7 @@ package kvblock_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -232,6 +233,85 @@ func BenchmarkScoredLookupAfterChurn(b *testing.B) {
 			b.Fatal(err)
 		}
 		if len(stats) != 96 {
+			b.Fatalf("unexpected stats size %d", len(stats))
+		}
+	}
+}
+
+// BenchmarkScoredLookupGLMSharedHotWrites models a 66K-token request over
+// 40 serving pods with eight rank entries per pod while KV events update the
+// same request keys. It exercises the lock contention absent from writers
+// that only add unrelated keys.
+func BenchmarkScoredLookupGLMSharedHotWrites(b *testing.B) {
+	const (
+		numKeys    = 1034
+		numPods    = 40
+		numRanks   = 8
+		numWriters = 4
+	)
+	ctx := context.Background()
+	idx, err := kvblock.NewInMemoryIndex(&kvblock.InMemoryIndexConfig{
+		Size:         1 << 20,
+		PodCacheSize: numPods * numRanks * 2,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	keys := make([]kvblock.BlockHash, numKeys)
+	for i := range keys {
+		keys[i] = kvblock.BlockHash(uint64(i) + 1)
+	}
+	entries := make([]kvblock.PodEntry, 0, numPods*numRanks)
+	for pod := 0; pod < numPods; pod++ {
+		for rank := 0; rank < numRanks; rank++ {
+			entries = append(entries, kvblock.PodEntry{
+				PodIdentifier: fmt.Sprintf("10.0.0.%d:8000", pod),
+				DeviceTier:    "gpu",
+				HasGroup:      true,
+				GroupIdx:      kvblock.GroupID(rank),
+			})
+		}
+	}
+	if err := idx.Add(ctx, nil, keys, entries); err != nil {
+		b.Fatal(err)
+	}
+
+	stop := make(chan struct{})
+	var writers sync.WaitGroup
+	for writer := 0; writer < numWriters; writer++ {
+		writers.Add(1)
+		go func(writer int) {
+			defer writers.Done()
+			entry := []kvblock.PodEntry{{
+				PodIdentifier: fmt.Sprintf("10.1.0.%d:8000", writer),
+				DeviceTier:    "gpu",
+			}}
+			for i := writer; ; i += numWriters {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				key := keys[i%len(keys)]
+				_ = idx.Add(ctx, nil, []kvblock.BlockHash{key}, entry)
+				_ = idx.Evict(ctx, key, kvblock.RequestKey, entry)
+			}
+		}(writer)
+	}
+	defer func() {
+		close(stop)
+		writers.Wait()
+	}()
+
+	tierWeights := map[string]float64{"gpu": 1.0}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		stats, err := idx.ScoredLookup(ctx, keys, nil, tierWeights)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(stats) < numPods {
 			b.Fatalf("unexpected stats size %d", len(stats))
 		}
 	}

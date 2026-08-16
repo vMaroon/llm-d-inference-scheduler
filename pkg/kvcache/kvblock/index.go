@@ -146,28 +146,6 @@ type Index interface {
 	Clear(ctx context.Context, podIdentifier string) error
 }
 
-// PrefixMatch contains the longest contiguous prefix match for one pod. Score
-// is device-tier weighted; CachedBlocks is unweighted; CachedBlocksByTier keeps
-// an independent contiguous count for every tier present at the first block.
-type PrefixMatch struct {
-	Score              float64
-	CachedBlocks       int
-	CachedBlocksByTier map[string]int
-}
-
-// PrefixMatchLookup is an optional fast path for an index that can aggregate
-// per-pod prefix matches while traversing its entries. It avoids materializing
-// every block's PodEntry slice for a separate scorer and endpoint pass.
-type PrefixMatchLookup interface {
-	LookupPrefixMatches(
-		ctx context.Context,
-		requestKeys []BlockHash,
-		podIdentifierSet sets.Set[string],
-		mediumWeights map[string]float64,
-		speculativeTier string,
-	) (map[string]PrefixMatch, error)
-}
-
 // KeyType indicates whether a key passed to Evict is an engine key or a request key.
 type KeyType int
 
