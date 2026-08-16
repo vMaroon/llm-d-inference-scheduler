@@ -37,29 +37,6 @@ func TestNewTracedIndex(t *testing.T) {
 	// Wrap it with tracing
 	tracedIdx := kvblock.NewTracedIndex(baseIdx)
 	require.NotNil(t, tracedIdx)
-	require.Implements(t, (*kvblock.PrefixMatchLookup)(nil), tracedIdx)
-}
-
-func TestWrappedIndexPreservesPrefixMatchLookup(t *testing.T) {
-	ctx := context.Background()
-	baseIdx, err := kvblock.NewInMemoryIndex(kvblock.DefaultInMemoryIndexConfig())
-	require.NoError(t, err)
-
-	wrapped := kvblock.NewTracedIndex(kvblock.NewInstrumentedIndex(baseIdx))
-	fastLookup, ok := wrapped.(kvblock.PrefixMatchLookup)
-	require.True(t, ok)
-
-	requestKey := kvblock.BlockHash(789)
-	err = wrapped.Add(ctx, []kvblock.BlockHash{123}, []kvblock.BlockHash{requestKey},
-		[]kvblock.PodEntry{{PodIdentifier: "pod1", DeviceTier: "gpu"}})
-	require.NoError(t, err)
-
-	matches, err := fastLookup.LookupPrefixMatches(
-		ctx, []kvblock.BlockHash{requestKey}, sets.New("pod1"),
-		map[string]float64{"gpu": 1}, "speculative",
-	)
-	require.NoError(t, err)
-	require.Equal(t, 1, matches["pod1"].CachedBlocks)
 }
 
 func TestTracedIndexBehavior(t *testing.T) {

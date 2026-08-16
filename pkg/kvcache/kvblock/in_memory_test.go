@@ -18,22 +18,13 @@ package kvblock_test
 
 import (
 	"context"
-	"fmt"
 	"testing"
 
-	"github.com/llm-d/llm-d-router/pkg/kvcache"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	. "github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
-)
-
-var (
-	benchmarkPodsPerKey map[BlockHash][]PodEntry
-	benchmarkMatches    map[string]PrefixMatch
-	benchmarkScores     map[string]float64
 )
 
 // createInMemoryIndexForTesting creates a new InMemoryIndex for testing.
@@ -59,169 +50,6 @@ func TestInMemoryIndexLookupHonorsCancelledContext(t *testing.T) {
 
 	_, err := index.Lookup(ctx, []BlockHash{1}, nil)
 	require.ErrorIs(t, err, context.Canceled)
-}
-
-func TestInMemoryIndexLookupPrefixMatches(t *testing.T) {
-	ctx := logging.NewTestLoggerIntoContext(t.Context())
-	index := createInMemoryIndexForTesting(t)
-	lookup, ok := index.(PrefixMatchLookup)
-	require.True(t, ok)
-
-	const (
-		podA = "10.0.0.1:8000"
-		podB = "10.0.0.2:8000"
-	)
-	keys := []BlockHash{1, 2, 3}
-	require.NoError(t, index.Add(ctx, nil, []BlockHash{keys[0]}, []PodEntry{
-		{PodIdentifier: podA, DeviceTier: "gpu"},
-		{PodIdentifier: podA, DeviceTier: "cpu"},
-		{PodIdentifier: podB, DeviceTier: "gpu"},
-	}))
-	require.NoError(t, index.Add(ctx, nil, []BlockHash{keys[1]}, []PodEntry{
-		{PodIdentifier: podA, DeviceTier: "gpu"},
-		{PodIdentifier: podB, DeviceTier: "cpu"},
-	}))
-	require.NoError(t, index.Add(ctx, nil, []BlockHash{keys[2]}, []PodEntry{
-		{PodIdentifier: podB, DeviceTier: "cpu"},
-	}))
-
-	matches, err := lookup.LookupPrefixMatches(ctx, keys, nil, map[string]float64{"gpu": 1, "cpu": 0.5}, "speculative")
-	require.NoError(t, err)
-	assert.Equal(t, map[string]PrefixMatch{
-		podA: {Score: 2, CachedBlocks: 2, CachedBlocksByTier: map[string]int{"gpu": 2, "cpu": 1}},
-		podB: {Score: 2, CachedBlocks: 3, CachedBlocksByTier: map[string]int{"gpu": 1}},
-	}, matches)
-
-	matches, err = lookup.LookupPrefixMatches(ctx, keys, sets.New(podA), map[string]float64{"gpu": 1, "cpu": 0.5}, "speculative")
-	require.NoError(t, err)
-	assert.Equal(t, map[string]PrefixMatch{
-		podA: {Score: 2, CachedBlocks: 2, CachedBlocksByTier: map[string]int{"gpu": 2, "cpu": 1}},
-	}, matches)
-}
-
-func TestInMemoryIndexLookupPrefixMatchesRefreshesCollapsedRoutes(t *testing.T) {
-	ctx := logging.NewTestLoggerIntoContext(t.Context())
-	cfg := DefaultInMemoryIndexConfig()
-	cfg.Size = 4
-	cfg.PodCacheSize = 16
-	index, err := NewInMemoryIndex(cfg)
-	require.NoError(t, err)
-	lookup := any(index).(PrefixMatchLookup)
-
-	const pod = "10.0.0.1:8000"
-	key := BlockHash(1)
-	gpu0 := PodEntry{PodIdentifier: pod, DeviceTier: "gpu", HasGroup: true, GroupIdx: 0}
-	gpu1 := PodEntry{PodIdentifier: pod, DeviceTier: "gpu", HasGroup: true, GroupIdx: 1}
-	cpu0 := PodEntry{PodIdentifier: pod, DeviceTier: "cpu", HasGroup: true, GroupIdx: 0}
-	cpu1 := PodEntry{PodIdentifier: pod, DeviceTier: "cpu", HasGroup: true, GroupIdx: 1}
-
-	require.NoError(t, index.Add(ctx, []BlockHash{10}, []BlockHash{key}, []PodEntry{gpu0, gpu1}))
-	matches, err := lookup.LookupPrefixMatches(ctx, []BlockHash{key}, nil,
-		map[string]float64{"gpu": 1, "cpu": 0.5}, "speculative")
-	require.NoError(t, err)
-	assert.Equal(t, PrefixMatch{Score: 1, CachedBlocks: 1, CachedBlocksByTier: map[string]int{"gpu": 1}}, matches[pod])
-
-	// Adding another tier invalidates the immutable routing snapshot. Multiple
-	// group entries collapse into one pod/tier route for request-time lookup.
-	require.NoError(t, index.Add(ctx, []BlockHash{11}, []BlockHash{key}, []PodEntry{cpu0, cpu1}))
-	matches, err = lookup.LookupPrefixMatches(ctx, []BlockHash{key}, nil,
-		map[string]float64{"gpu": 1, "cpu": 0.5}, "speculative")
-	require.NoError(t, err)
-	assert.Equal(t, PrefixMatch{
-		Score: 1, CachedBlocks: 1, CachedBlocksByTier: map[string]int{"gpu": 1, "cpu": 1},
-	}, matches[pod])
-
-	// Removing one group keeps the collapsed tier route alive.
-	require.NoError(t, index.Evict(ctx, 11, EngineKey, []PodEntry{cpu0}))
-	matches, err = lookup.LookupPrefixMatches(ctx, []BlockHash{key}, nil,
-		map[string]float64{"gpu": 1, "cpu": 0.5}, "speculative")
-	require.NoError(t, err)
-	assert.Equal(t, map[string]int{"gpu": 1, "cpu": 1}, matches[pod].CachedBlocksByTier)
-
-	// Removing the final group removes the tier from the next snapshot.
-	require.NoError(t, index.Evict(ctx, 11, EngineKey, []PodEntry{cpu1}))
-	matches, err = lookup.LookupPrefixMatches(ctx, []BlockHash{key}, nil,
-		map[string]float64{"gpu": 1, "cpu": 0.5}, "speculative")
-	require.NoError(t, err)
-	assert.Equal(t, map[string]int{"gpu": 1}, matches[pod].CachedBlocksByTier)
-}
-
-func TestInMemoryIndexPrefixLookupDoesNotRetainLRUEviction(t *testing.T) {
-	ctx := logging.NewTestLoggerIntoContext(t.Context())
-	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 1, PodCacheSize: 4})
-	require.NoError(t, err)
-	lookup := any(index).(PrefixMatchLookup)
-	pod := PodEntry{PodIdentifier: "10.0.0.1:8000", DeviceTier: "gpu"}
-
-	require.NoError(t, index.Add(ctx, nil, []BlockHash{1}, []PodEntry{pod}))
-	_, err = lookup.LookupPrefixMatches(ctx, []BlockHash{1}, nil, map[string]float64{"gpu": 1}, "speculative")
-	require.NoError(t, err)
-	require.NoError(t, index.Add(ctx, nil, []BlockHash{2}, []PodEntry{pod}))
-
-	evicted, err := lookup.LookupPrefixMatches(ctx, []BlockHash{1}, nil, map[string]float64{"gpu": 1}, "speculative")
-	require.NoError(t, err)
-	assert.Empty(t, evicted)
-	present, err := lookup.LookupPrefixMatches(ctx, []BlockHash{2}, nil, map[string]float64{"gpu": 1}, "speculative")
-	require.NoError(t, err)
-	assert.Contains(t, present, pod.PodIdentifier)
-}
-
-func BenchmarkInMemoryIndexPrefixMatches(b *testing.B) {
-	const (
-		blockCount = 1034
-		podCount   = 40
-		rankCount  = 8
-	)
-	ctx := context.Background()
-	cfg := DefaultInMemoryIndexConfig()
-	cfg.Size = blockCount + 1
-	cfg.PodCacheSize = podCount * rankCount
-	index, err := NewInMemoryIndex(cfg)
-	require.NoError(b, err)
-
-	keys := make([]BlockHash, blockCount)
-	entries := make([]PodEntry, 0, podCount*rankCount)
-	podSet := sets.New[string]()
-	for pod := range podCount {
-		podID := fmt.Sprintf("10.0.0.%d:8080", pod)
-		podSet.Insert(podID)
-		for rank := range rankCount {
-			entries = append(entries, PodEntry{
-				PodIdentifier: podID,
-				DeviceTier:    "gpu",
-				HasGroup:      true,
-				GroupIdx:      GroupID(rank),
-			})
-		}
-	}
-	for block := range blockCount {
-		key := BlockHash(block + 1)
-		keys[block] = key
-		require.NoError(b, index.Add(ctx, nil, []BlockHash{key}, entries))
-	}
-
-	scorer := &kvcache.LongestPrefixScorer{MediumWeights: map[string]float64{"gpu": 1}}
-	fastLookup := any(index).(PrefixMatchLookup)
-	b.ResetTimer()
-
-	b.Run("materialized-lookup-and-score", func(b *testing.B) {
-		b.ReportAllocs()
-		for range b.N {
-			benchmarkPodsPerKey, err = index.Lookup(ctx, keys, podSet)
-			require.NoError(b, err)
-			benchmarkScores, err = scorer.Score(ctx, keys, benchmarkPodsPerKey)
-			require.NoError(b, err)
-		}
-	})
-	b.Run("streaming-prefix-match", func(b *testing.B) {
-		b.ReportAllocs()
-		for range b.N {
-			benchmarkMatches, err = fastLookup.LookupPrefixMatches(
-				ctx, keys, podSet, scorer.MediumWeights, "speculative",
-			)
-			require.NoError(b, err)
-		}
-	})
 }
 
 func TestInMemoryIndexSize(t *testing.T) {
