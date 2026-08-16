@@ -53,27 +53,6 @@ func (f *fakeKVCacheIndexer) ComputeBlockKeysFromTokens(ctx context.Context, tok
 
 func (f *fakeKVCacheIndexer) KVBlockIndex() kvblock.Index { return f.index }
 
-type fakePrefixMatchIndex struct {
-	*fakeKVBlockIndex
-	lookupPrefixMatches func(
-		ctx context.Context,
-		keys []kvblock.BlockHash,
-		podSet sets.Set[string],
-		mediumWeights map[string]float64,
-		speculativeTier string,
-	) (map[string]kvblock.PrefixMatch, error)
-}
-
-func (f *fakePrefixMatchIndex) LookupPrefixMatches(
-	ctx context.Context,
-	keys []kvblock.BlockHash,
-	podSet sets.Set[string],
-	mediumWeights map[string]float64,
-	speculativeTier string,
-) (map[string]kvblock.PrefixMatch, error) {
-	return f.lookupPrefixMatches(ctx, keys, podSet, mediumWeights, speculativeTier)
-}
-
 type fakeKVBlockIndex struct {
 	lookup  func(ctx context.Context, keys []kvblock.BlockHash, podSet sets.Set[string]) (map[kvblock.BlockHash][]kvblock.PodEntry, error)
 	addFn   func(ctx context.Context, prevKeys, keys []kvblock.BlockHash, entries []kvblock.PodEntry) error
@@ -107,6 +86,17 @@ func (f *fakeKVBlockIndex) Clear(ctx context.Context, podIdentifier string) erro
 		return f.clearFn(ctx, podIdentifier)
 	}
 	return nil
+}
+
+type fakeScoredKVBlockIndex struct {
+	*fakeKVBlockIndex
+	scoredLookup func(ctx context.Context, keys []kvblock.BlockHash, podSet sets.Set[string], tierWeights map[string]float64) (map[string]kvblock.PodMatchStats, error)
+}
+
+func (f *fakeScoredKVBlockIndex) ScoredLookup(ctx context.Context, keys []kvblock.BlockHash,
+	podSet sets.Set[string], tierWeights map[string]float64,
+) (map[string]kvblock.PodMatchStats, error) {
+	return f.scoredLookup(ctx, keys, podSet, tierWeights)
 }
 
 type fakeKVBlockScorer struct {
@@ -156,6 +146,21 @@ func freshEndpoints() []scheduling.Endpoint {
 				Port:    "8080",
 			}, nil, nil),
 	}
+}
+
+type cancelOnMetadataEndpoint struct {
+	scheduling.Endpoint
+	cancel   context.CancelFunc
+	calls    int
+	cancelOn int
+}
+
+func (e *cancelOnMetadataEndpoint) GetMetadata() *fwkdl.EndpointMetadata {
+	e.calls++
+	if e.calls == e.cancelOn {
+		e.cancel()
+	}
+	return e.Endpoint.GetMetadata()
 }
 
 func newProducerWithIndexer(ctx context.Context, idx kvCacheIndexer, scorer kvcache.KVBlockScorer) *Producer {
@@ -228,62 +233,69 @@ func TestProduce_UsesTokenizedPrompt(t *testing.T) {
 	assert.Nil(t, info2.MM(), "text-only request must leave MM untracked")
 }
 
-func TestProduce_UsesPrefixMatchLookupFastPath(t *testing.T) {
-	ctx := utils.NewTestContext(t)
-	keys := []kvblock.BlockHash{1, 2, 3}
-	const addr = "10.0.0.1:8080"
+func TestProduce_CancellationPublishesNoEndpointResults(t *testing.T) {
+	for _, fused := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fused=%t", fused), func(t *testing.T) {
+			baseCtx := utils.NewTestContext(t)
+			ctx, cancel := context.WithCancel(baseCtx)
+			defer cancel()
 
-	index := &fakePrefixMatchIndex{
-		fakeKVBlockIndex: &fakeKVBlockIndex{
-			lookup: func(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string]) (map[kvblock.BlockHash][]kvblock.PodEntry, error) {
-				t.Fatal("legacy Lookup must not run when the index supports PrefixMatchLookup")
-				return nil, nil
-			},
-		},
-		lookupPrefixMatches: func(
-			_ context.Context,
-			gotKeys []kvblock.BlockHash,
-			podSet sets.Set[string],
-			mediumWeights map[string]float64,
-			speculativeTier string,
-		) (map[string]kvblock.PrefixMatch, error) {
-			assert.Equal(t, keys, gotKeys)
-			assert.True(t, podSet.Has(addr))
-			assert.Equal(t, map[string]float64{"gpu": 1, "cpu": 0.5}, mediumWeights)
-			assert.Equal(t, attrprefix.SpeculativeTierKey, speculativeTier)
-			return map[string]kvblock.PrefixMatch{
-				addr: {
-					Score:              2.5,
-					CachedBlocks:       3,
-					CachedBlocksByTier: map[string]int{"gpu": 2, "cpu": 1},
+			const key = kvblock.BlockHash(0xCAFE)
+			baseIndex := &fakeKVBlockIndex{
+				lookup: func(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string]) (map[kvblock.BlockHash][]kvblock.PodEntry, error) {
+					return map[kvblock.BlockHash][]kvblock.PodEntry{
+						key: {{PodIdentifier: "10.0.0.1:8080"}},
+					}, nil
 				},
-			}, nil
-		},
-	}
-	idx := &fakeKVCacheIndexer{
-		computeFromTokens: func(_ context.Context, _ []uint32, _ string, _ []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
-			return keys, nil
-		},
-		index: index,
-	}
-	p := newProducerWithIndexer(ctx, idx, &kvcache.LongestPrefixScorer{
-		MediumWeights: map[string]float64{"gpu": 1, "cpu": 0.5},
-	})
-	endpoints := freshEndpoints()
-	req := &scheduling.InferenceRequest{
-		RequestID: "fast-path",
-		Body: &fwkrh.InferenceRequestBody{
-			TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{{1, 2, 3}}},
-		},
-	}
+			}
+			var index kvblock.Index = baseIndex
+			if fused {
+				index = &fakeScoredKVBlockIndex{
+					fakeKVBlockIndex: baseIndex,
+					scoredLookup: func(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string], _ map[string]float64) (map[string]kvblock.PodMatchStats, error) {
+						return map[string]kvblock.PodMatchStats{
+							"10.0.0.1:8080": {
+								WeightedScore: 1,
+								MatchedBlocks: 1,
+								BlocksByTier:  map[string]int{"gpu": 1},
+							},
+						}, nil
+					},
+				}
+			}
 
-	require.NoError(t, p.Produce(ctx, req, endpoints))
-	raw, ok := endpoints[0].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test"))
-	require.True(t, ok)
-	info := raw.(*attrprefix.PrefixCacheMatchInfo)
-	assert.Equal(t, 2, info.MatchBlocks())
-	assert.Equal(t, 3, info.CachedBlockCount())
-	assert.Equal(t, map[string]int{"gpu": 2, "cpu": 1}, info.CachedBlocksByTier())
+			idx := &fakeKVCacheIndexer{
+				computeFromTokens: func(_ context.Context, _ []uint32, _ string, _ []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
+					return []kvblock.BlockHash{key}, nil
+				},
+				index: index,
+			}
+			scorer := &fakeKVBlockScorer{
+				score: func(_ context.Context, _ []kvblock.BlockHash, _ map[kvblock.BlockHash][]kvblock.PodEntry) (map[string]float64, error) {
+					return map[string]float64{"10.0.0.1:8080": 1}, nil
+				},
+			}
+			p := newProducerWithIndexer(baseCtx, idx, scorer)
+			endpoints := freshEndpoints()
+			endpoints[1] = &cancelOnMetadataEndpoint{
+				Endpoint: endpoints[1], cancel: cancel, cancelOn: 2,
+			}
+			req := &scheduling.InferenceRequest{
+				RequestID:   "req-cancel-publish",
+				TargetModel: "test-model",
+				Body: &fwkrh.InferenceRequestBody{
+					TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{make([]uint32, testBlockSize)}},
+				},
+			}
+
+			err := p.Produce(ctx, req, endpoints)
+			require.ErrorIs(t, err, context.Canceled)
+			for _, ep := range endpoints {
+				_, published := ep.Get(p.dk)
+				assert.False(t, published, "canceled production must not publish a partial result")
+			}
+		})
+	}
 }
 
 // No tokens → no-op (no prompt-string fallback).
@@ -520,48 +532,6 @@ func TestProduce_WritesCachedBlocksByTier(t *testing.T) {
 	assert.Equal(t, 0, info.CachedBlockCount())
 	assert.NotNil(t, info.CachedBlocksByTier())
 	assert.Empty(t, info.CachedBlocksByTier())
-}
-
-func TestProduce_DeadlinePublishesNoPartialEndpointResults(t *testing.T) {
-	baseCtx := utils.NewTestContext(t)
-	ctx, cancel := context.WithCancel(baseCtx)
-	endpoints := freshEndpoints()
-	key := kvblock.BlockHash(0xA1)
-
-	idx := &fakeKVCacheIndexer{
-		computeFromTokens: func(_ context.Context, _ []uint32, _ string, _ []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
-			return []kvblock.BlockHash{key}, nil
-		},
-		index: &fakeKVBlockIndex{
-			lookup: func(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string]) (map[kvblock.BlockHash][]kvblock.PodEntry, error) {
-				return map[kvblock.BlockHash][]kvblock.PodEntry{
-					key: {{PodIdentifier: "10.0.0.1:8080", DeviceTier: "gpu"}},
-				}, nil
-			},
-		},
-	}
-	scorer := &fakeKVBlockScorer{
-		score: func(_ context.Context, _ []kvblock.BlockHash, _ map[kvblock.BlockHash][]kvblock.PodEntry) (map[string]float64, error) {
-			cancel()
-			return map[string]float64{"10.0.0.1:8080": 1}, nil
-		},
-	}
-	p := newProducerWithIndexer(baseCtx, idx, scorer)
-	req := &scheduling.InferenceRequest{
-		RequestID:   "req-cancel-before-publish",
-		TargetModel: "test-model",
-		Body: &fwkrh.InferenceRequestBody{TokenizedPrompt: &fwkrh.TokenizedPrompt{
-			PerPromptTokens: [][]uint32{{1, 2, 3, 4}},
-		}},
-	}
-
-	err := p.Produce(ctx, req, endpoints)
-	require.ErrorIs(t, err, context.Canceled)
-	keyForProducer := attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test")
-	for _, endpoint := range endpoints {
-		_, found := endpoint.Get(keyForProducer)
-		assert.False(t, found, "deadline must not publish a subset of endpoint affinity results")
-	}
 }
 
 // MM match uses cachedBlocks (literal), not matchLen (tier-weighted score).
