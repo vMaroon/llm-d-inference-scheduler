@@ -18,6 +18,7 @@ package kvblock_test
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -172,6 +173,27 @@ func TestScoredLookupDoesNotRefreshIndexLRU(t *testing.T) {
 	assert.Contains(t, stats, "pod-a")
 }
 
+func TestLookupDoesNotRefreshIndexLRU(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(t.Context())
+	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 2, PodCacheSize: 1})
+	require.NoError(t, err)
+
+	entry := []PodEntry{{PodIdentifier: "pod-a", DeviceTier: "gpu"}}
+	require.NoError(t, index.Add(ctx, nil, []BlockHash{10}, entry))
+	require.NoError(t, index.Add(ctx, nil, []BlockHash{20}, entry))
+
+	pods, err := index.Lookup(ctx, []BlockHash{10}, nil)
+	require.NoError(t, err)
+	require.Contains(t, pods, BlockHash(10))
+
+	require.NoError(t, index.Add(ctx, nil, []BlockHash{30}, entry))
+
+	pods, err = index.Lookup(ctx, []BlockHash{10, 20}, nil)
+	require.NoError(t, err)
+	assert.NotContains(t, pods, BlockHash(10))
+	assert.Contains(t, pods, BlockHash(20))
+}
+
 // Pod churn (interned ids from pods since cleared) must change neither
 // results nor the candidate slot assignment.
 func TestScoredLookupAfterPodChurn(t *testing.T) {
@@ -262,4 +284,64 @@ func TestScoredLookupConcurrentNewTiers(t *testing.T) {
 	}
 	close(stop)
 	<-done
+}
+
+// Concurrent readers sharing one index must each observe complete results.
+// BenchmarkScoredLookupParallel only checks the result size so its timed loop
+// stays cheap; full per-pod validation under the same contention lives here.
+func TestScoredLookupConcurrentReadersAgree(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(t.Context())
+	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 1 << 12, PodCacheSize: 16})
+	require.NoError(t, err)
+
+	const numKeys, numPods = 200, 4
+	keys := make([]BlockHash, numKeys)
+	for i := range keys {
+		keys[i] = BlockHash(i + 1)
+	}
+	entries := make([]PodEntry, numPods)
+	for p := range entries {
+		entries[p] = PodEntry{PodIdentifier: fmt.Sprintf("pod-%d", p), DeviceTier: "gpu"}
+	}
+	require.NoError(t, index.Add(ctx, nil, keys, entries))
+
+	const readers, iterations = 8, 40
+	errCh := make(chan error, readers)
+	var wg sync.WaitGroup
+	for r := 0; r < readers; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range iterations {
+				stats, err := index.ScoredLookup(ctx, keys, nil, scoredLookupTierWeights)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				if len(stats) != numPods {
+					errCh <- fmt.Errorf("got %d pods, want %d", len(stats), numPods)
+					return
+				}
+				for p := range numPods {
+					pod := fmt.Sprintf("pod-%d", p)
+					got, ok := stats[pod]
+					if !ok {
+						errCh <- fmt.Errorf("missing %s", pod)
+						return
+					}
+					if got.MatchedBlocks != numKeys || got.WeightedScore != float64(numKeys) ||
+						got.BlocksByTier["gpu"] != numKeys {
+						errCh <- fmt.Errorf("%s: matched=%d score=%v gpu=%d, want %d each",
+							pod, got.MatchedBlocks, got.WeightedScore, got.BlocksByTier["gpu"], numKeys)
+						return
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
 }
