@@ -126,7 +126,7 @@ func TestProduce_MessagesVLLMHTTPUsesTypedWireBody(t *testing.T) {
 					Role:    "user",
 					Content: fwkrh.AnthropicContent{Raw: "Hi"},
 				}},
-				Tools: []any{map[string]any{"name": "read_file"}},
+				Tools: []fwkrh.AnthropicTool{{Name: "read_file"}},
 			},
 		},
 	}
@@ -150,6 +150,41 @@ func TestProduce_MessagesVLLMHTTPUsesTypedWireBody(t *testing.T) {
 	tools, ok := sent["tools"].([]any)
 	require.True(t, ok)
 	require.Len(t, tools, 1)
+}
+
+func TestProduce_MessagesVLLMHTTPHandlesToolOnlyAssistant(t *testing.T) {
+	srv, cap := httpFixture(t, nil, renderResponse{TokenIDs: []uint32{8, 9}})
+	defer srv.Close()
+
+	req := &scheduling.InferenceRequest{
+		Body: &fwkrh.InferenceRequestBody{
+			Messages: &fwkrh.MessagesRequest{
+				Messages: []fwkrh.AnthropicMessage{{
+					Role: "assistant",
+					Content: fwkrh.AnthropicContent{Structured: []fwkrh.AnthropicContentBlock{{
+						Type:  "tool_use",
+						ID:    "toolu_01",
+						Name:  "read_file",
+						Input: json.RawMessage(`{"path":"README.md"}`),
+					}}},
+				}},
+			},
+		},
+	}
+
+	p := newTestPlugin(newHTTPRenderer(t, srv))
+	require.NoError(t, p.Produce(context.Background(), req, nil))
+
+	var sent map[string]any
+	require.NoError(t, json.Unmarshal(cap.chat, &sent))
+	assert.Equal(t, testHTTPModel, sent["model"])
+	messages, ok := sent["messages"].([]any)
+	require.True(t, ok)
+	require.Len(t, messages, 1)
+	assistant, ok := messages[0].(map[string]any)
+	require.True(t, ok)
+	assert.NotContains(t, assistant, "content")
+	require.Len(t, assistant["tool_calls"], 1)
 }
 
 // TestVLLMHTTPRenderer_RenderChat_Multimodal covers the chat endpoint: the raw

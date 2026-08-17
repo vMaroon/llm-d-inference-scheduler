@@ -179,10 +179,11 @@ func (r *vllmHTTPRenderer) RenderChat(ctx context.Context, payload fwkrh.Request
 func (r *vllmHTTPRenderer) RenderChatRequest(
 	ctx context.Context, request *tokenizerTypes.RenderChatRequest,
 ) ([]uint32, *tokenization.MultiModalFeatures, error) {
-	body := buildChatRenderRequest(r.modelName, request)
+	body := buildChatRenderRequest(request)
+	body.Model = r.modelName
 	timeout := r.timeout
 	for _, message := range body.Messages {
-		if len(message.Content.Parts) > 0 {
+		if message.Content != nil && len(message.Content.Parts) > 0 {
 			timeout = r.mmTimeout
 			break
 		}
@@ -234,6 +235,7 @@ func (r *vllmHTTPRenderer) produceTimeout() time.Duration {
 // Used by the non-PayloadMap fallback path (gRPC, warmup). The model is
 // stamped in by the renderer, not carried here.
 type chatRenderRequest struct {
+	Model                string         `json:"model,omitempty"`
 	Messages             []chatMessage  `json:"messages"`
 	Tools                []any          `json:"tools,omitempty"`
 	Documents            []any          `json:"documents,omitempty"`
