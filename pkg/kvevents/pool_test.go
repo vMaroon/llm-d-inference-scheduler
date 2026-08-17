@@ -851,6 +851,116 @@ func TestHMAGroupKindFilter(t *testing.T) {
 	}
 }
 
+func TestHMAGroupKindFilterUsesKnownKindForLegacyDeviceTierUpdate(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, tp := newTestPool(t, 16)
+	groupIdx := 0
+	tokens := makeTokens(64)
+	engineKeys := makeEngineKeys(4, 925)
+
+	// A self-describing GPU store establishes both the group metadata and the
+	// engine-to-request mapping used by the location-only CPU update.
+	pool.processEventBatch(ctx, &EventBatch{Events: []GenericEvent{
+		&BlockStoredEvent{
+			BlockHashes:     engineKeys,
+			Tokens:          tokens,
+			GroupIdx:        &groupIdx,
+			KVCacheSpecKind: KVCacheSpecKindFullAttention,
+			BlockSize:       16,
+			DeviceTier:      "GPU",
+		},
+	}}, "pod-hma", "test-model")
+
+	// Legacy offloading updates carry the group and engine hashes, but may omit
+	// the cache kind and tokens. The known group kind must remain authoritative.
+	pool.processEventBatch(ctx, &EventBatch{Events: []GenericEvent{
+		&BlockStoredEvent{
+			BlockHashes: engineKeys,
+			GroupIdx:    &groupIdx,
+			DeviceTier:  "CPU",
+		},
+	}}, "pod-hma", "test-model")
+
+	meta, ok := pool.GroupCatalog().Get("pod-hma", kvblock.GroupID(groupIdx))
+	require.True(t, ok)
+	assert.Equal(t, string(KVCacheSpecKindFullAttention), meta.Kind)
+
+	canonicalKeys, err := tp.TokensToKVBlockKeys(
+		kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	require.NoError(t, err)
+	for _, key := range canonicalKeys {
+		result, err := idx.Lookup(ctx, []kvblock.BlockHash{key}, nil)
+		require.NoError(t, err)
+		require.Len(t, result[key], 2)
+		tiers := map[string]bool{}
+		for _, entry := range result[key] {
+			tiers[entry.DeviceTier] = true
+		}
+		assert.True(t, tiers["gpu"])
+		assert.True(t, tiers["cpu"])
+	}
+}
+
+func TestHMAGroupKindFilterDoesNotAssumeUnknownKindIsFullAttention(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, tp := newTestPool(t, 16)
+	groupIdx := 0
+	tokens := makeTokens(64)
+
+	pool.processEventBatch(ctx, &EventBatch{Events: []GenericEvent{
+		&BlockStoredEvent{
+			BlockHashes: makeEngineKeys(4, 940),
+			Tokens:      tokens,
+			GroupIdx:    &groupIdx,
+			BlockSize:   16,
+		},
+	}}, "pod-unknown", "test-model")
+
+	_, ok := pool.GroupCatalog().Get("pod-unknown", kvblock.GroupID(groupIdx))
+	assert.False(t, ok)
+	canonicalKeys, err := tp.TokensToKVBlockKeys(
+		kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	require.NoError(t, err)
+	result, err := idx.Lookup(ctx, canonicalKeys, nil)
+	require.NoError(t, err)
+	for _, key := range canonicalKeys {
+		assert.Empty(t, result[key])
+	}
+}
+
+func TestHMAGroupKindFilterKeepsKnownUnsupportedKindRejected(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, _ := newTestPool(t, 16)
+	groupIdx := 1
+	engineKeys := makeEngineKeys(4, 960)
+
+	pool.processEventBatch(ctx, &EventBatch{Events: []GenericEvent{
+		&BlockStoredEvent{
+			BlockHashes:     engineKeys,
+			Tokens:          makeTokens(64),
+			GroupIdx:        &groupIdx,
+			KVCacheSpecKind: KVCacheSpecKindMamba,
+			BlockSize:       16,
+			DeviceTier:      "GPU",
+		},
+	}}, "pod-hma", "test-model")
+	pool.processEventBatch(ctx, &EventBatch{Events: []GenericEvent{
+		&BlockStoredEvent{
+			BlockHashes: engineKeys,
+			GroupIdx:    &groupIdx,
+			DeviceTier:  "CPU",
+		},
+	}}, "pod-hma", "test-model")
+
+	meta, ok := pool.GroupCatalog().Get("pod-hma", kvblock.GroupID(groupIdx))
+	require.True(t, ok)
+	assert.Equal(t, string(KVCacheSpecKindMamba), meta.Kind)
+	for _, engineKey := range engineKeys {
+		_, err := idx.GetRequestKey(ctx, kvblock.BlockHash(engineKey))
+		assert.Error(t, err)
+	}
+}
+
 func TestHMAGroupFilterRejectsSparseFullAttentionBeforeParentLookup(t *testing.T) {
 	ctx := logging.NewTestLoggerIntoContext(context.Background())
 	pool, idx, _ := newTestPool(t, 16)
