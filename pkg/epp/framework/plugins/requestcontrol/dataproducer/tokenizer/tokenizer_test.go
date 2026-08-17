@@ -43,7 +43,7 @@ func BenchmarkMessagesRenderPreparation240K(b *testing.B) {
 			Role:    "user",
 			Content: fwkrh.AnthropicContent{Raw: "Inspect the code."},
 		}},
-		Tools: []any{map[string]any{"name": "read_file"}},
+		Tools: []fwkrh.AnthropicTool{{Name: "read_file"}},
 	}}
 
 	b.Run("generic-map-round-trip", func(b *testing.B) {
@@ -64,7 +64,7 @@ func BenchmarkMessagesRenderPreparation240K(b *testing.B) {
 		b.ReportAllocs()
 		request := MessagesToRenderChatRequest(body.Messages)
 		for range b.N {
-			if _, err := json.Marshal(buildChatRenderRequest(testHTTPModel, request)); err != nil {
+			if _, err := json.Marshal(buildChatRenderRequest(request)); err != nil {
 				b.Fatal(err)
 			}
 		}
