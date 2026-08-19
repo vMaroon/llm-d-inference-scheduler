@@ -61,6 +61,7 @@ import (
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
 	attrlatency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/latency"
+	attrlatencycost "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/latencycost"
 	attrmodels "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/models"
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
 	attrsession "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/session"
@@ -85,6 +86,7 @@ import (
 	reqdataprodprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/approximateprefix"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/burstprefix"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/inflightload"
+	latencycostproducer "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/latencycost"
 	mmproducer "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/multimodal"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/p2psource"
 	preciseproducer "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/preciseprefixcache"
@@ -116,6 +118,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/endpointattribute"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/kvcacheutilization"
 	latencyscorer "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/latency"
+	latencycostscorer "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/latencycost"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/loadaware"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/loraaffinity"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/mmcacheaffinity"
@@ -583,6 +586,7 @@ func (r *Runner) registerInTreePlugins() {
 	fwkplugin.Register(runningrequests.RunningRequestsSizeScorerType, runningrequests.RunningRequestsSizeScorerFactory)
 	fwkplugin.Register(loraaffinity.LoraAffinityScorerType, loraaffinity.LoraAffinityScorerFactory)
 	fwkplugin.Register(tokenload.TokenLoadScorerType, tokenload.TokenLoadScorerFactory)
+	fwkplugin.Register(latencycostscorer.LatencyCostScorerType, latencycostscorer.Factory)
 	fwkplugin.Register(nohitlru.NoHitLRUType, nohitlru.Factory)
 	fwkplugin.Register(activerequest.ActiveRequestType, activerequest.Factory)
 	fwkplugin.Register(preciseprefixcache.PrecisePrefixCachePluginType, preciseprefixcache.PluginFactory)
@@ -604,6 +608,7 @@ func (r *Runner) registerInTreePlugins() {
 	// Register Request level data producer plugins as defaults for their respective data keys.
 	fwkplugin.RegisterAsDefaultProducer(reqdataprodprefix.ApproxPrefixCachePluginType, reqdataprodprefix.ApproxPrefixCacheFactory, attrprefix.PrefixCacheMatchInfoDataKey)
 	fwkplugin.RegisterAsDefaultProducer(inflightload.InFlightLoadProducerType, inflightload.InFlightLoadProducerFactory, attrconcurrency.InFlightLoadDataKey)
+	fwkplugin.RegisterAsDefaultProducer(latencycostproducer.PluginType, latencycostproducer.PluginFactory, attrlatencycost.LatencyCostInfoDataKey)
 	fwkplugin.RegisterAsDefaultProducer(mmproducer.ProducerType, mmproducer.Factory, mmproducer.ProducedKey)
 	fwkplugin.RegisterAsDefaultProducer(latencyproducer.LatencyDataProviderPluginType, latencyproducer.PredictedLatencyFactory, attrlatency.LatencyPredictionInfoDataKey)
 	fwkplugin.RegisterAsDefaultProducer(tokenizer.PluginType, tokenizer.PluginFactory, tokenizer.TokenizedPromptDataKey)

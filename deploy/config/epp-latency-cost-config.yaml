@@ -1,0 +1,27 @@
+# Sample EPP configuration for latency-cost routing: endpoints are ranked by
+# their predicted time-to-first-token in milliseconds (queue wait + KV fetch +
+# prefill compute), computed by the latency-cost-producer.
+#
+# The coefficients are calibration outputs, not tuning knobs: measure them
+# against the serving pods (prefill sweep for prefillTokensPerSecond and
+# attentionHalfLengthTokens, CPU-tier warm sweep for cpuOnloadMsPerToken,
+# decode-load sweep for decodeInterferencePerRequest).
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- type: single-profile-handler
+- type: decode-filter
+- type: latency-cost-producer
+  parameters:
+    prefillTokensPerSecond: 15928
+    attentionHalfLengthTokens: 25000
+    cpuOnloadMsPerToken: 0.005
+    decodeInterferencePerRequest: 0.03
+- type: latency-cost-scorer
+- type: max-score-picker
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: decode-filter
+  - pluginRef: latency-cost-scorer
+  - pluginRef: max-score-picker
