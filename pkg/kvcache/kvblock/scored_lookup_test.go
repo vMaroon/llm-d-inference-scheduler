@@ -63,10 +63,10 @@ func TestScoredLookup(t *testing.T) {
 			wantStats: map[string]PodMatchStats{
 				// Per block the highest tier weight counts: gpu, gpu, cpu.
 				// gpu chain breaks at key 30, cpu chain at key 20.
-				podA: {WeightedScore: 2.8, MatchedBlocks: 3, BlocksByTier: map[string]int{"gpu": 2, "cpu": 1}},
+				podA: {WeightedScore: 2.8, MatchedBlocks: 3, ConfirmedBlocks: 3, BlocksByTier: map[string]int{"gpu": 2, "cpu": 1}},
 				// gpu@10 then cpu@20: any-tier chain spans both, no tier
 				// survives past its own break.
-				podB: {WeightedScore: 1.8, MatchedBlocks: 2, BlocksByTier: map[string]int{"gpu": 1}},
+				podB: {WeightedScore: 1.8, MatchedBlocks: 2, ConfirmedBlocks: 2, BlocksByTier: map[string]int{"gpu": 1}},
 			},
 		},
 		{
@@ -77,7 +77,7 @@ func TestScoredLookup(t *testing.T) {
 			},
 			requestKeys: keys,
 			wantStats: map[string]PodMatchStats{
-				podA: {WeightedScore: 1.0, MatchedBlocks: 1, BlocksByTier: map[string]int{"gpu": 1}},
+				podA: {WeightedScore: 1.0, MatchedBlocks: 1, ConfirmedBlocks: 1, BlocksByTier: map[string]int{"gpu": 1}},
 			},
 		},
 		{
@@ -103,7 +103,7 @@ func TestScoredLookup(t *testing.T) {
 			requestKeys: []BlockHash{10, 20},
 			podFilter:   sets.New(podB),
 			wantStats: map[string]PodMatchStats{
-				podB: {WeightedScore: 2.0, MatchedBlocks: 2, BlocksByTier: map[string]int{"gpu": 2}},
+				podB: {WeightedScore: 2.0, MatchedBlocks: 2, ConfirmedBlocks: 2, BlocksByTier: map[string]int{"gpu": 2}},
 			},
 		},
 		{
@@ -113,7 +113,20 @@ func TestScoredLookup(t *testing.T) {
 			},
 			requestKeys: []BlockHash{10},
 			wantStats: map[string]PodMatchStats{
-				podA: {WeightedScore: 1.0, MatchedBlocks: 1, BlocksByTier: map[string]int{SpeculativeTier: 1}},
+				podA: {WeightedScore: 1.0, MatchedBlocks: 1, ConfirmedBlocks: 0, BlocksByTier: map[string]int{SpeculativeTier: 1}},
+			},
+		},
+		{
+			name: "confirmed chain stops at a speculative-only block",
+			entries: map[BlockHash][]PodEntry{
+				10: {{PodIdentifier: podA, Speculative: true}, {PodIdentifier: podA, DeviceTier: "gpu"}},
+				20: {{PodIdentifier: podA, DeviceTier: "cpu"}},
+				30: {{PodIdentifier: podA, Speculative: true}},
+			},
+			requestKeys: keys,
+			wantStats: map[string]PodMatchStats{
+				podA: {WeightedScore: 2.8, MatchedBlocks: 3, ConfirmedBlocks: 2,
+					BlocksByTier: map[string]int{SpeculativeTier: 1, "gpu": 1}},
 			},
 		},
 	}
@@ -135,6 +148,7 @@ func TestScoredLookup(t *testing.T) {
 				require.True(t, ok, "missing pod %q", pod)
 				assert.InDelta(t, want.WeightedScore, got.WeightedScore, 0.0001, "pod %q weighted score", pod)
 				assert.Equal(t, want.MatchedBlocks, got.MatchedBlocks, "pod %q matched blocks", pod)
+				assert.Equal(t, want.ConfirmedBlocks, got.ConfirmedBlocks, "pod %q confirmed blocks", pod)
 				assert.Equal(t, want.BlocksByTier, got.BlocksByTier, "pod %q blocks by tier", pod)
 			}
 		})

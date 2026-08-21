@@ -2,6 +2,7 @@ package kvevents //nolint:testpackage // tests use unexported processEventBatch
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -42,6 +43,14 @@ type recordingIndex struct {
 	kvblock.Index
 	getRequestKeyCalls int
 	evictCalls         int
+}
+
+type failingClearIndex struct {
+	kvblock.Index
+}
+
+func (i *failingClearIndex) Clear(context.Context, string) error {
+	return errors.New("clear failed")
 }
 
 func (i *recordingIndex) GetRequestKey(ctx context.Context, engineKey kvblock.BlockHash) (kvblock.BlockHash, error) {
@@ -1026,6 +1035,129 @@ func TestAllBlocksCleared_Dispatch(t *testing.T) {
 		require.Len(t, result[ck], 1, "only the surviving pod should remain on key %s", ck)
 		assert.Equal(t, "pod-kept", result[ck][0].PodIdentifier)
 	}
+}
+
+func TestPool_ReportsRepairIntegritySignals(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, _, _ := newTestPool(t, 16)
+	var got []StreamEvent
+	pool.SetStreamObserver(func(endpoint string, event StreamEvent) {
+		assert.Equal(t, "10.0.0.9:8000", endpoint)
+		got = append(got, event)
+	})
+
+	pool.processEventBatch(ctx, &EventBatch{Events: []GenericEvent{
+		&BlockStoredEvent{BlockHashes: []uint64{2}, Tokens: makeTokens(16), ParentHash: 1},
+	}}, "10.0.0.9:8000", "test-model")
+	pool.processEventBatch(ctx, &EventBatch{Events: []GenericEvent{
+		&AllBlocksClearedEvent{},
+	}}, "10.0.0.9:8000", "test-model")
+
+	assert.Equal(t, []StreamEvent{StreamEventMissingParent, StreamEventKnownEmpty}, got)
+}
+
+func TestPool_AuthoritativeSnapshotRequiresCleanProcessing(t *testing.T) {
+	pool, _, _ := newTestPool(t, 16)
+	var got []StreamEvent
+	pool.SetStreamObserver(func(_ string, event StreamEvent) { got = append(got, event) })
+	const endpoint = "10.0.0.9:8000"
+
+	pool.processRawMessage(t.Context(), &RawMessage{SourceEndpoint: endpoint, snapshotStart: true})
+	pool.NotifyStreamEvent(endpoint, StreamEventMissingParent)
+	pool.processRawMessage(t.Context(), &RawMessage{SourceEndpoint: endpoint, snapshotEnd: true})
+	assert.Equal(t, []StreamEvent{StreamEventMissingParent}, got,
+		"a failed replay must not claim an authoritative snapshot")
+
+	pool.processRawMessage(t.Context(), &RawMessage{SourceEndpoint: endpoint, snapshotStart: true})
+	pool.processRawMessage(t.Context(), &RawMessage{SourceEndpoint: endpoint, snapshotEnd: true})
+	assert.Equal(t, []StreamEvent{StreamEventMissingParent, StreamEventAuthoritativeSnapshot}, got)
+}
+
+func TestPool_AuthoritativeSnapshotRequiresSuccessfulReset(t *testing.T) {
+	pool, idx, _ := newTestPool(t, 16)
+	pool.index = &failingClearIndex{Index: idx}
+	var got []StreamEvent
+	pool.SetStreamObserver(func(_ string, event StreamEvent) { got = append(got, event) })
+	const endpoint = "10.0.0.9:8000"
+
+	pool.processRawMessage(t.Context(), &RawMessage{SourceEndpoint: endpoint, snapshotStart: true})
+	pool.processRawMessage(t.Context(), &RawMessage{SourceEndpoint: endpoint, reset: true})
+	pool.processRawMessage(t.Context(), &RawMessage{SourceEndpoint: endpoint, snapshotEnd: true})
+
+	assert.Equal(t, []StreamEvent{StreamEventProcessingFailure}, got,
+		"a replay whose index reset failed must not claim an authoritative snapshot")
+}
+
+func TestPool_OnlyNewestOverlappingSnapshotCanBecomeAuthoritative(t *testing.T) {
+	pool, _, _ := newTestPool(t, 16)
+	var got []StreamEvent
+	pool.SetStreamObserver(func(_ string, event StreamEvent) { got = append(got, event) })
+	const endpoint = "10.0.0.9:8000"
+
+	pool.processRawMessage(t.Context(), &RawMessage{
+		SourceEndpoint: endpoint, snapshotStart: true, snapshotGeneration: 1,
+	})
+	pool.processRawMessage(t.Context(), &RawMessage{
+		SourceEndpoint: endpoint, snapshotStart: true, snapshotGeneration: 2,
+	})
+	pool.processRawMessage(t.Context(), &RawMessage{
+		SourceEndpoint: endpoint, snapshotEnd: true, snapshotGeneration: 1,
+	})
+	assert.Empty(t, got, "the superseded replay must not become authoritative")
+
+	pool.processRawMessage(t.Context(), &RawMessage{
+		SourceEndpoint: endpoint, snapshotEnd: true, snapshotGeneration: 2,
+	})
+	assert.Equal(t, []StreamEvent{StreamEventAuthoritativeSnapshot}, got)
+}
+
+func TestPool_HistoricalClearWaitsForReplayOutcome(t *testing.T) {
+	pool, _, _ := newTestPool(t, 16)
+	var got []StreamEvent
+	pool.SetStreamObserver(func(_ string, event StreamEvent) { got = append(got, event) })
+	const endpoint = "10.0.0.9:8000"
+	clearBatch := &EventBatch{Events: []GenericEvent{&AllBlocksClearedEvent{}}}
+
+	pool.processRawMessage(t.Context(), &RawMessage{
+		SourceEndpoint: endpoint, snapshotStart: true, snapshotGeneration: 1,
+	})
+	pool.processEventBatchWithGeneration(t.Context(), clearBatch, endpoint, "test-model", 1)
+	assert.Empty(t, got, "a historical clear is not the replay's final state")
+	pool.processRawMessage(t.Context(), &RawMessage{
+		SourceEndpoint: endpoint, snapshotEnd: true, snapshotGeneration: 1,
+	})
+	assert.Equal(t, []StreamEvent{StreamEventAuthoritativeSnapshot}, got)
+
+	got = nil
+	pool.processRawMessage(t.Context(), &RawMessage{
+		SourceEndpoint: endpoint, snapshotStart: true, snapshotGeneration: 2,
+	})
+	pool.processEventBatchWithGeneration(t.Context(), clearBatch, endpoint, "test-model", 2)
+	pool.notifyStreamEvent(endpoint, StreamEventMissingParent, 2)
+	pool.processRawMessage(t.Context(), &RawMessage{
+		SourceEndpoint: endpoint, snapshotEnd: true, snapshotGeneration: 2,
+	})
+	assert.Equal(t, []StreamEvent{StreamEventMissingParent}, got,
+		"a failed replay must not emit a signal that clears repair eligibility")
+}
+
+func TestPool_DetachRetiresQueuedSnapshotGeneration(t *testing.T) {
+	pool, _, _ := newTestPool(t, 16)
+	var got []StreamEvent
+	pool.SetStreamObserver(func(_ string, event StreamEvent) { got = append(got, event) })
+	const endpoint = "10.0.0.9:8000"
+
+	oldGeneration := pool.snapshotGeneration.Add(1)
+	pool.NotifyStreamEvent(endpoint, StreamEventDetached)
+	pool.processRawMessage(t.Context(), &RawMessage{
+		SourceEndpoint: endpoint, snapshotStart: true, snapshotGeneration: oldGeneration,
+	})
+	pool.processRawMessage(t.Context(), &RawMessage{
+		SourceEndpoint: endpoint, snapshotEnd: true, snapshotGeneration: oldGeneration,
+	})
+
+	assert.Equal(t, []StreamEvent{StreamEventDetached}, got,
+		"a canceled subscriber's queued replay must stay retired")
 }
 
 // TestPool_AllBlocksClearedResetsDedup verifies the filter is reset on

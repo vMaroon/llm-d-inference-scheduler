@@ -66,6 +66,36 @@ func TestSubscriberManager_EnsureSubscriber(t *testing.T) {
 	assert.Len(t, identifiers, 0)
 }
 
+func TestSubscriberManager_StreamEventsUseSourceEndpoint(t *testing.T) {
+	ctx := context.Background()
+	index, err := kvblock.NewIndex(ctx, kvblock.DefaultIndexConfig())
+	require.NoError(t, err)
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	require.NoError(t, err)
+	pool := kvevents.NewPool(kvevents.DefaultConfig(), index, tokenProcessor, engineadapter.NewVLLMAdapter())
+
+	type observed struct {
+		endpoint string
+		event    kvevents.StreamEvent
+	}
+	var got []observed
+	pool.SetStreamObserver(func(endpoint string, event kvevents.StreamEvent) {
+		got = append(got, observed{endpoint: endpoint, event: event})
+	})
+	sm := kvevents.NewSubscriberManager(pool)
+	const podID = "namespace/metadata-id-that-differs"
+	const sourceEndpoint = "10.0.0.7:8003"
+
+	require.NoError(t, sm.EnsureSubscriber(ctx, podID, sourceEndpoint,
+		"tcp://127.0.0.1:5557", "", "kv@", true))
+	sm.RemoveSubscriber(ctx, podID)
+
+	require.Equal(t, []observed{
+		{endpoint: sourceEndpoint, event: kvevents.StreamEventAttached},
+		{endpoint: sourceEndpoint, event: kvevents.StreamEventDetached},
+	}, got)
+}
+
 func TestSubscriberManager_RemoveSubscriber(t *testing.T) {
 	ctx := context.Background()
 

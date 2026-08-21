@@ -67,7 +67,33 @@ type RawMessage struct {
 	SourceEndpoint string
 	// reset clears the message's pod before later messages on the same queue.
 	reset bool
+	// streamEvent is an ordered control marker for stream integrity state.
+	streamEvent   StreamEvent
+	snapshotStart bool
+	snapshotEnd   bool
+	snapshotAbort bool
+	// snapshotGeneration correlates replay control and event tasks when an
+	// endpoint's old and replacement subscribers overlap during cancellation.
+	snapshotGeneration uint64
 }
+
+// StreamEvent describes an endpoint KV-event stream transition relevant to
+// consumers that can repair an incomplete derived index.
+type StreamEvent string
+
+const (
+	StreamEventAttached              StreamEvent = "attached"
+	StreamEventDetached              StreamEvent = "detached"
+	StreamEventMissingParent         StreamEvent = "missing_parent"
+	StreamEventSequenceDiscontinuity StreamEvent = "sequence_discontinuity"
+	StreamEventProcessingFailure     StreamEvent = "processing_failure"
+	StreamEventKnownEmpty            StreamEvent = "known_empty"
+	StreamEventAuthoritativeSnapshot StreamEvent = "authoritative_snapshot"
+)
+
+// StreamObserver receives stream transitions keyed by the serving endpoint
+// address used by the scheduler (address:port).
+type StreamObserver func(sourceEndpoint string, event StreamEvent)
 
 // EngineAdapter defines the interface for engine-specific message parsers.
 // Each inference engine has its own adapter implementation that handles

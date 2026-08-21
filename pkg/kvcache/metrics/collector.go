@@ -204,6 +204,30 @@ var (
 		Help: metricsutil.HelpMsgWithStability(
 			"Number of worker shards (capacity) in the event processing pool", compbasemetrics.ALPHA),
 	})
+	// FullReportRepairSignals counts endpoint stream transitions consumed by
+	// precise-prefix full-report repair.
+	FullReportRepairSignals = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: routerSubsystem, Name: "kv_cache_full_report_repair_signals_total",
+		Help: metricsutil.HelpMsgWithStability(
+			"Total number of endpoint stream transitions observed by full-report repair",
+			compbasemetrics.ALPHA),
+	}, []string{"event"})
+	// FullReportRepairRequests counts request bodies marked for a full KV-cache
+	// report, split by threshold or one-shot integrity bypass.
+	FullReportRepairRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: routerSubsystem, Name: "kv_cache_full_report_repair_requests_total",
+		Help: metricsutil.HelpMsgWithStability(
+			"Total number of requests marked for a full KV-cache report",
+			compbasemetrics.ALPHA),
+	}, []string{"reason"})
+	// FullReportRepairEligibleEndpoints tracks endpoints whose event-derived
+	// index is eligible for bounded request-driven repair.
+	FullReportRepairEligibleEndpoints = prometheus.NewGauge(prometheus.GaugeOpts{
+		Subsystem: routerSubsystem, Name: "kv_cache_full_report_repair_eligible_endpoints",
+		Help: metricsutil.HelpMsgWithStability(
+			"Number of endpoints eligible for request-driven full-report repair",
+			compbasemetrics.ALPHA),
+	})
 )
 
 // Collectors returns a slice of all registered Prometheus collectors.
@@ -215,6 +239,7 @@ func Collectors() []prometheus.Collector {
 		KVEventStoresSkipped, KVEventRemovalsSkipped,
 		SubscriberActive, SubscriberReconnections, MessagesReceived, ZMQErrors,
 		PoolQueueDepth, PoolCapacity,
+		FullReportRepairSignals, FullReportRepairRequests, FullReportRepairEligibleEndpoints,
 	}
 }
 

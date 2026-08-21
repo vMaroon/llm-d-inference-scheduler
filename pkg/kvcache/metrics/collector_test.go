@@ -60,6 +60,9 @@ func TestCollectorsIncludesAllMetrics(t *testing.T) {
 		{"ZMQErrors", ZMQErrors},
 		{"PoolQueueDepth", PoolQueueDepth},
 		{"PoolCapacity", PoolCapacity},
+		{"FullReportRepairSignals", FullReportRepairSignals},
+		{"FullReportRepairRequests", FullReportRepairRequests},
+		{"FullReportRepairEligibleEndpoints", FullReportRepairEligibleEndpoints},
 	}
 
 	for _, e := range expected {

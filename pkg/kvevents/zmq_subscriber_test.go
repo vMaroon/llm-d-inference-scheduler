@@ -463,6 +463,7 @@ func TestZMQSubscriber_ShortSequenceFrameSkipped(t *testing.T) {
 type replayHarness struct {
 	ctx    context.Context
 	index  kvblock.Index
+	pool   *kvevents.Pool
 	buffer *replayBuffer
 	pub    zmq4.Socket
 	topic  []byte
@@ -523,10 +524,54 @@ func newReplayHarnessWithBehavior(
 	return &replayHarness{
 		ctx:    ctx,
 		index:  index,
+		pool:   pool,
 		buffer: buffer,
 		pub:    pub,
 		topic:  []byte("kv@10.0.0.1:8000@TestModel"),
 	}
+}
+
+func TestZMQSubscriber_FirstNonzeroSequenceReportsSourceEndpoint(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	index, err := kvblock.NewIndex(ctx, kvblock.DefaultIndexConfig())
+	require.NoError(t, err)
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	require.NoError(t, err)
+	pool := kvevents.NewPool(kvevents.DefaultConfig(), index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	pool.Start(ctx)
+	defer pool.Shutdown(ctx)
+
+	type observed struct {
+		endpoint string
+		event    kvevents.StreamEvent
+	}
+	events := make(chan observed, 8)
+	pool.SetStreamObserver(func(endpoint string, event kvevents.StreamEvent) {
+		events <- observed{endpoint: endpoint, event: event}
+	})
+
+	pubEndpoint := availableEndpoint(t, ctx)
+	manager := kvevents.NewSubscriberManager(pool)
+	defer manager.Shutdown(ctx)
+	const sourceEndpoint = "10.0.0.7:8003"
+	require.NoError(t, manager.EnsureSubscriber(ctx, "namespace/different-metadata-id",
+		sourceEndpoint, pubEndpoint, "", "kv@", false))
+	pub := zmq4.NewPub(ctx)
+	defer pub.Close()
+	require.NoError(t, pub.Dial(pubEndpoint))
+	time.Sleep(100 * time.Millisecond)
+	require.NoError(t, pub.Send(zmq4.NewMsgFrom(
+		[]byte("kv@10.0.0.7:8003@TestModel"), seqFrame(5), buildDistinctBlockStoredPayload(t, 100))))
+
+	require.Eventually(t, func() bool {
+		select {
+		case got := <-events:
+			return got.endpoint == sourceEndpoint && got.event == kvevents.StreamEventSequenceDiscontinuity
+		default:
+			return false
+		}
+	}, 5*time.Second, 25*time.Millisecond)
 }
 
 func TestZMQSubscriber_ProactiveReplayResumesAfterPartialResponse(t *testing.T) {
@@ -642,6 +687,14 @@ func TestZMQSubscriber_ProactiveReplayRebuildsServingEndpoint(t *testing.T) {
 
 func TestZMQSubscriber_GapReplayDoesNotDuplicateTriggeringEvent(t *testing.T) {
 	h := newReplayHarness(t, nil, false)
+	type observed struct {
+		endpoint string
+		event    kvevents.StreamEvent
+	}
+	events := make(chan observed, 16)
+	h.pool.SetStreamObserver(func(endpoint string, event kvevents.StreamEvent) {
+		events <- observed{endpoint: endpoint, event: event}
+	})
 	h.send(t, 0, buildDistinctBlockStoredPayload(t, 100))
 	require.Eventually(t, func() bool {
 		_, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(100))
@@ -653,6 +706,14 @@ func TestZMQSubscriber_GapReplayDoesNotDuplicateTriggeringEvent(t *testing.T) {
 		replayMessage{seq: 2, payload: buildDistinctBlockStoredPayload(t, 300)},
 	)
 	h.send(t, 2, buildDistinctBlockStoredPayload(t, 300))
+	require.Eventually(t, func() bool {
+		select {
+		case got := <-events:
+			return got.endpoint == "10.0.0.1:8000" && got.event == kvevents.StreamEventSequenceDiscontinuity
+		default:
+			return false
+		}
+	}, 5*time.Second, 25*time.Millisecond)
 	require.Eventually(t, func() bool { return h.buffer.requests.Load() == 2 },
 		5*time.Second, 50*time.Millisecond, "gap replay expected")
 	require.Eventually(t, func() bool {

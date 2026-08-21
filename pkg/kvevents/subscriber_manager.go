@@ -83,6 +83,7 @@ func (sm *SubscriberManager) EnsureSubscriber(
 			"oldReplayEndpoint", entry.replayEndpoint,
 			"newReplayEndpoint", replayEndpoint)
 		entry.cancel()
+		sm.pool.NotifyStreamEvent(streamIdentity(podIdentifier, entry.sourceEndpoint), StreamEventDetached)
 		delete(sm.subscribers, podIdentifier)
 		// The replacement subscriber below reuses podIdentifier, so its series
 		// are kept rather than cleaned up.
@@ -111,6 +112,7 @@ func (sm *SubscriberManager) EnsureSubscriber(
 		done:           done,
 	}
 	metrics.SubscriberActive.Set(float64(len(sm.subscribers)))
+	sm.pool.NotifyStreamEvent(streamIdentity(podIdentifier, sourceEndpoint), StreamEventAttached)
 
 	debugLogger.Info("Subscriber created and started", "podIdentifier", podIdentifier, "endpoint", endpoint)
 	return nil
@@ -131,6 +133,7 @@ func (sm *SubscriberManager) RemoveSubscriber(ctx context.Context, podIdentifier
 
 	debugLogger.Info("Removing subscriber", "podIdentifier", podIdentifier, "endpoint", entry.endpoint)
 	entry.cancel()
+	sm.pool.NotifyStreamEvent(streamIdentity(podIdentifier, entry.sourceEndpoint), StreamEventDetached)
 	delete(sm.subscribers, podIdentifier)
 	metrics.SubscriberActive.Set(float64(len(sm.subscribers)))
 	cleanupSubscriberMetrics(podIdentifier, entry.done)
@@ -157,12 +160,20 @@ func (sm *SubscriberManager) Shutdown(ctx context.Context) {
 	for podIdentifier, entry := range sm.subscribers {
 		debugLogger.Info("Shutting down subscriber", "podIdentifier", podIdentifier)
 		entry.cancel()
+		sm.pool.NotifyStreamEvent(streamIdentity(podIdentifier, entry.sourceEndpoint), StreamEventDetached)
 		cleanupSubscriberMetrics(podIdentifier, entry.done)
 	}
 
 	sm.subscribers = make(map[string]*subscriberEntry)
 	metrics.SubscriberActive.Set(0)
 	debugLogger.Info("All subscribers shut down")
+}
+
+func streamIdentity(podIdentifier, sourceEndpoint string) string {
+	if sourceEndpoint != "" {
+		return sourceEndpoint
+	}
+	return podIdentifier
 }
 
 // GetActiveSubscribers returns the list of active pod identifiers and their endpoints.

@@ -35,6 +35,25 @@ upstream. No-op otherwise.
 | `kvEventsConfig` | object | `kvevents.DefaultConfig()` | KV-events pool config. |
 | `speculativeIndexing` | bool | `false` | Seed predicted entries on routing decisions. |
 | `speculativeTTL` | duration | `2s` | TTL for speculative entries. |
+| `fullReportRepair` | object | disabled | Enables bounded requests for authoritative per-request KV-cache reports. |
+| `fullReportRepair.fullReportThreshold` | number | `0.80` | Request a full report when the selected endpoint's confirmed contiguous match is below this fraction. |
+| `fullReportRepair.minMissingBlocks` | integer | `32` | Minimum confirmed-block deficit required before requesting a full report. |
+| `fullReportRepair.prefillProfileName` | string | `prefill` | Disaggregation prefill profile whose selected endpoint is evaluated for repair. |
+
+Full-report repair is opt-in. A newly attached endpoint is eligible for repair.
+It requires per-pod discovery and rejects global `kvEventsConfig.zmqEndpoint`
+mode because global stream identities cannot be joined to scheduler `address:port`
+endpoint keys.
+The producer adds `vllm_xargs.kv_cache_report_mode: full` only when at least
+`minMissingBlocks` are absent and the confirmed, non-speculative match is below
+`fullReportThreshold`. Missing-parent, sequence-discontinuity, and event-processing
+faults bypass the ratio once for the next selected request. Eligibility clears only
+after a known-empty cache reset or an authoritative replay snapshot; sending a full
+report is an attempt, not proof that the endpoint is repaired.
+The request argument is body-wide, so a disaggregated decoder may also compute a
+full report; keep reports bounded and measure decoder overhead before enabling this
+repair in production. Scope `kvEventsConfig.podDiscoveryConfig.podLabelSelector`
+to prefiller endpoints when the precise index is intended to model prefill residency.
 
 Set `kvEventsConfig.engineType` to `sglang` for SGLang KV-events. It defaults
 to `vllm` when omitted.

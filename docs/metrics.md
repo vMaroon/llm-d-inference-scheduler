@@ -379,6 +379,9 @@ Prefix `llm_d_epp_`. Registered only when the embedded llm-d-kv-cache metrics ar
 | `kv_cache_index_lookup_latency_seconds` | Histogram | Index lookup latency. |
 | `kv_cache_events_dedup_removed_hashes_suppressed_total` | Counter | Deduplicated removal hashes suppressed. |
 | `kv_cache_events_dedup_removed_hashes_forwarded_total` | Counter | Deduplicated removal hashes forwarded. |
+| `kv_cache_full_report_repair_signals_total` | Counter | Endpoint lifecycle and integrity transitions consumed by full-report repair; label `event`. |
+| `kv_cache_full_report_repair_requests_total` | Counter | Requests marked with `kv_cache_report_mode=full`; label `reason` (`threshold` or `integrity`). |
+| `kv_cache_full_report_repair_eligible_endpoints` | Gauge | Endpoints eligible for request-driven repair. |
 
 ### MoRI-IO DNS re-resolution
 

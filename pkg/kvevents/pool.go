@@ -165,7 +165,18 @@ type Pool struct {
 	// queueDepth mirrors the number of tasks queued across all shards. It is
 	// tracked incrementally rather than by summing queue.Len() so that the
 	// depth gauge stays O(1) on the enqueue/dequeue hot path.
-	queueDepth atomic.Int64
+	queueDepth         atomic.Int64
+	observerMu         sync.RWMutex
+	observer           StreamObserver
+	snapshotMu         sync.Mutex
+	snapshots          map[string]snapshotState
+	snapshotGeneration atomic.Uint64
+}
+
+type snapshotState struct {
+	generation uint64
+	failed     bool
+	active     bool
 }
 
 // NewPool creates a Pool with a sharded worker setup.
@@ -190,6 +201,7 @@ func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProce
 		adapter:        adapter,
 		groupCatalog:   kvblock.NewGroupCatalog(),
 		dedup:          newEventDedupFilter(),
+		snapshots:      make(map[string]snapshotState),
 	}
 
 	for i := 0; i < p.concurrency; i++ {
@@ -199,6 +211,49 @@ func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProce
 	metrics.Register()
 
 	return p
+}
+
+// SetStreamObserver installs the observer for endpoint stream state. It is
+// normally called before Start.
+func (p *Pool) SetStreamObserver(observer StreamObserver) {
+	p.observerMu.Lock()
+	defer p.observerMu.Unlock()
+	p.observer = observer
+}
+
+// NotifyStreamEvent reports a stream transition using the scheduler's serving
+// endpoint identity.
+func (p *Pool) NotifyStreamEvent(sourceEndpoint string, event StreamEvent) {
+	p.notifyStreamEvent(sourceEndpoint, event, 0)
+}
+
+func (p *Pool) notifyStreamEvent(sourceEndpoint string, event StreamEvent, snapshotGeneration uint64) {
+	if sourceEndpoint == "" || event == "" {
+		return
+	}
+	if event == StreamEventDetached {
+		// Retire every generation allocated before this detach. The old
+		// subscriber may still have queued replay tasks while its cancellation
+		// completes; the high-water mark keeps those tasks stale.
+		p.snapshotMu.Lock()
+		p.snapshots[sourceEndpoint] = snapshotState{generation: p.snapshotGeneration.Add(1)}
+		p.snapshotMu.Unlock()
+	} else if event == StreamEventMissingParent || event == StreamEventSequenceDiscontinuity ||
+		event == StreamEventProcessingFailure {
+		p.snapshotMu.Lock()
+		if state, exists := p.snapshots[sourceEndpoint]; exists && state.active &&
+			(snapshotGeneration == 0 || snapshotGeneration == state.generation) {
+			state.failed = true
+			p.snapshots[sourceEndpoint] = state
+		}
+		p.snapshotMu.Unlock()
+	}
+	p.observerMu.RLock()
+	observer := p.observer
+	p.observerMu.RUnlock()
+	if observer != nil {
+		observer(sourceEndpoint, event)
+	}
 }
 
 // addQueueDepth adjusts the tracked queue depth by delta and publishes the new
@@ -268,8 +323,36 @@ func (p *Pool) AddTask(task *RawMessage) {
 }
 
 // resetForSource queues a pod reset on the same shard as its event stream.
-func (p *Pool) resetForSource(topic, sourceEndpoint string) {
-	p.AddTask(&RawMessage{Topic: topic, SourceEndpoint: sourceEndpoint, reset: true})
+func (p *Pool) resetForSource(topic, sourceEndpoint string, snapshotGeneration uint64) {
+	p.AddTask(&RawMessage{
+		Topic: topic, SourceEndpoint: sourceEndpoint, reset: true,
+		snapshotGeneration: snapshotGeneration,
+	})
+}
+
+// signalAfterEvents queues an integrity transition behind all prior events
+// from the same source endpoint.
+func (p *Pool) beginSnapshot(sourceEndpoint string) uint64 {
+	generation := p.snapshotGeneration.Add(1)
+	p.AddTask(&RawMessage{
+		SourceEndpoint: sourceEndpoint, snapshotStart: true,
+		snapshotGeneration: generation,
+	})
+	return generation
+}
+
+func (p *Pool) finishSnapshot(sourceEndpoint string, generation uint64) {
+	p.AddTask(&RawMessage{
+		SourceEndpoint: sourceEndpoint, snapshotEnd: true,
+		snapshotGeneration: generation,
+	})
+}
+
+func (p *Pool) abortSnapshot(sourceEndpoint string, generation uint64) {
+	p.AddTask(&RawMessage{
+		SourceEndpoint: sourceEndpoint, snapshotAbort: true,
+		snapshotGeneration: generation,
+	})
 }
 
 // worker is the main processing loop for a single worker goroutine.
@@ -304,34 +387,79 @@ func (p *Pool) worker(ctx context.Context, workerIndex int) {
 // processRawMessage decodes the raw message payload using the adapter and processes the resulting event batch.
 func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 	logger := log.FromContext(ctx)
+	if msg.snapshotStart {
+		p.snapshotMu.Lock()
+		state, active := p.snapshots[msg.SourceEndpoint]
+		if !active || msg.snapshotGeneration >= state.generation {
+			p.snapshots[msg.SourceEndpoint] = snapshotState{
+				generation: msg.snapshotGeneration,
+				active:     true,
+			}
+		}
+		p.snapshotMu.Unlock()
+		return
+	}
+	if msg.snapshotEnd || msg.snapshotAbort {
+		p.snapshotMu.Lock()
+		state, active := p.snapshots[msg.SourceEndpoint]
+		current := active && state.active && state.generation == msg.snapshotGeneration
+		if current {
+			state.active = false
+			p.snapshots[msg.SourceEndpoint] = state
+		}
+		p.snapshotMu.Unlock()
+		if msg.snapshotEnd && current && !state.failed {
+			p.NotifyStreamEvent(msg.SourceEndpoint, StreamEventAuthoritativeSnapshot)
+		}
+		return
+	}
+	if msg.snapshotGeneration != 0 && !p.isCurrentSnapshot(msg.SourceEndpoint, msg.snapshotGeneration) {
+		return
+	}
+	if msg.streamEvent != "" {
+		p.notifyStreamEvent(msg.SourceEndpoint, msg.streamEvent, msg.snapshotGeneration)
+		return
+	}
 	if msg.reset {
 		podID := msg.SourceEndpoint
 		if podID == "" {
 			podID = p.adapter.ShardingKey(msg)
 		}
-		p.clearPod(ctx, podID)
+		if !p.clearPod(ctx, podID) {
+			p.notifyStreamEvent(podID, StreamEventProcessingFailure, msg.snapshotGeneration)
+		}
 		return
 	}
 
 	podID, modelName, batch, err := p.adapter.ParseMessage(msg)
 	if err != nil {
 		logger.Error(err, "Failed to parse message")
+		p.notifyStreamEvent(msg.SourceEndpoint, StreamEventProcessingFailure, msg.snapshotGeneration)
 		return
 	}
 	if msg.SourceEndpoint != "" {
 		podID = msg.SourceEndpoint
 	}
 
-	p.processEventBatch(ctx, &batch, podID, modelName)
+	p.processEventBatchWithGeneration(ctx, &batch, podID, modelName, msg.snapshotGeneration)
 }
 
-func (p *Pool) clearPod(ctx context.Context, podIdentifier string) {
+func (p *Pool) isCurrentSnapshot(sourceEndpoint string, generation uint64) bool {
+	p.snapshotMu.Lock()
+	defer p.snapshotMu.Unlock()
+	state, exists := p.snapshots[sourceEndpoint]
+	return exists && state.active && state.generation == generation
+}
+
+func (p *Pool) clearPod(ctx context.Context, podIdentifier string) bool {
 	debugLogger := log.FromContext(ctx).V(logging.DEBUG)
 	if err := p.index.Clear(ctx, podIdentifier); err != nil {
 		debugLogger.Error(err, "Failed to clear pod from index",
 			"podIdentifier", podIdentifier)
+		return false
 	}
 	p.dedup.clear(podIdentifier)
+	return true
 }
 
 // realignExtraFeatures converts per-engine-block extra features to per-canonical-block
@@ -389,7 +517,7 @@ func realignExtraFeatures(engineFeatures []*kvblock.BlockExtraFeatures, canonica
 // and can reference-count it.
 func (p *Pool) handleDeviceTierUpdate(
 	ctx context.Context, tokens []uint32, engineKeys []kvblock.BlockHash,
-	podEntries []kvblock.PodEntry, podIdentifier, deviceTier string,
+	podEntries []kvblock.PodEntry, podIdentifier, deviceTier string, snapshotGeneration uint64,
 ) bool {
 	debugLogger := log.FromContext(ctx).V(logging.DEBUG)
 
@@ -421,6 +549,7 @@ func (p *Pool) handleDeviceTierUpdate(
 	if err := p.index.Add(ctx, nil, resolvedKeys, podEntries); err != nil {
 		debugLogger.Error(err, "Failed to add device-tier update to index",
 			"podIdentifier", podIdentifier, "deviceTier", deviceTier)
+		p.notifyStreamEvent(podIdentifier, StreamEventProcessingFailure, snapshotGeneration)
 		return false
 	}
 	return true
@@ -428,6 +557,12 @@ func (p *Pool) handleDeviceTierUpdate(
 
 // processEventBatch processes a batch of events using type switches.
 func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIdentifier, modelName string) {
+	p.processEventBatchWithGeneration(ctx, batch, podIdentifier, modelName, 0)
+}
+
+func (p *Pool) processEventBatchWithGeneration(
+	ctx context.Context, batch *EventBatch, podIdentifier, modelName string, snapshotGeneration uint64,
+) {
 	debugLogger := log.FromContext(ctx).V(logging.DEBUG)
 	debugLogger.V(logging.TRACE).Info("Processing event batch",
 		"podID", podIdentifier,
@@ -485,6 +620,9 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 					"numTokens", len(ev.Tokens),
 					"numBlockHashes", len(ev.BlockHashes),
 					"blockSize", ev.BlockSize)
+				if reason != "unsupported_cache_kind" {
+					p.notifyStreamEvent(podIdentifier, StreamEventProcessingFailure, snapshotGeneration)
+				}
 				continue
 			}
 
@@ -506,6 +644,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 						"numTokens", len(ev.Tokens),
 						"numBlockHashes", len(ev.BlockHashes),
 						"blockSize", ev.BlockSize)
+					p.notifyStreamEvent(podIdentifier, StreamEventMissingParent, snapshotGeneration)
 					continue
 				}
 				parentRequestKey = key
@@ -518,6 +657,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				if err != nil {
 					debugLogger.Error(err, "Failed to parse extra keys",
 						"podIdentifier", podIdentifier)
+					p.notifyStreamEvent(podIdentifier, StreamEventProcessingFailure, snapshotGeneration)
 					continue
 				}
 			}
@@ -567,11 +707,14 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			if err != nil {
 				debugLogger.Error(err, "Failed to generate request keys",
 					"podIdentifier", podIdentifier, "effectiveModelName", effectiveModelName)
+				p.notifyStreamEvent(podIdentifier, StreamEventProcessingFailure, snapshotGeneration)
 				continue
 			}
 
 			if len(requestKeys) == 0 {
-				if p.handleDeviceTierUpdate(ctx, ev.Tokens, engineKeys, podEntries, podIdentifier, deviceTier) {
+				if p.handleDeviceTierUpdate(
+					ctx, ev.Tokens, engineKeys, podEntries, podIdentifier, deviceTier, snapshotGeneration,
+				) {
 					p.dedup.trackStore(storeScope, ev.BlockHashes)
 				}
 				continue
@@ -582,6 +725,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			if err := p.index.Add(ctx, engineKeys, requestKeys, podEntries); err != nil {
 				debugLogger.Error(err, "Failed to add event to index",
 					"podIdentifier", podIdentifier, "event", ev)
+				p.notifyStreamEvent(podIdentifier, StreamEventProcessingFailure, snapshotGeneration)
 				continue
 			}
 			p.dedup.trackStore(storeScope, ev.BlockHashes)
@@ -603,6 +747,9 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 						"groupIdx", groupIdx,
 						"cacheKind", meta.Kind,
 						"groupKnown", found)
+					if !found {
+						p.notifyStreamEvent(podIdentifier, StreamEventProcessingFailure, snapshotGeneration)
+					}
 					continue
 				}
 			}
@@ -646,6 +793,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				if err := p.index.Evict(ctx, engineKey, kvblock.EngineKey, podEntries); err != nil {
 					debugLogger.Error(err, "Failed to evict engine key from index",
 						"podIdentifier", podIdentifier, "engineKey", engineKey)
+					p.notifyStreamEvent(podIdentifier, StreamEventProcessingFailure, snapshotGeneration)
 					continue
 				}
 			}
@@ -667,7 +815,17 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 					"anyway (tier-scoped clear is not supported)",
 					"podIdentifier", podIdentifier, "deviceTier", ev.DeviceTier)
 			}
-			p.clearPod(ctx, podIdentifier)
+			if p.clearPod(ctx, podIdentifier) {
+				// A historical clear inside a full replay is not the endpoint's
+				// final state: later replay events may repopulate the cache or fail.
+				// Only a live clear is authoritative by itself; a clean replay is
+				// declared authoritative by its ordered snapshot end marker.
+				if snapshotGeneration == 0 {
+					p.notifyStreamEvent(podIdentifier, StreamEventKnownEmpty, 0)
+				}
+			} else {
+				p.notifyStreamEvent(podIdentifier, StreamEventProcessingFailure, snapshotGeneration)
+			}
 
 		default:
 			debugLogger.Info("Unknown event", "podIdentifier", podIdentifier, "event", genericEvent)

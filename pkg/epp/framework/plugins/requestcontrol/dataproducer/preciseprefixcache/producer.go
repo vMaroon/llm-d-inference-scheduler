@@ -67,6 +67,9 @@ type PluginConfig struct {
 	// eviction. Go duration string; defaults to defaultSpeculativeTTL when
 	// empty.
 	SpeculativeTTL string `json:"speculativeTTL"`
+	// FullReportRepair enables bounded per-request cache reports that repair an
+	// event-derived index after attachment or an integrity fault.
+	FullReportRepair *FullReportRepairConfig `json:"fullReportRepair,omitempty"`
 }
 
 var (
@@ -115,6 +118,7 @@ type Producer struct {
 	speculativeCache   *ttlcache.Cache[string, *speculativeEntries]
 	speculativeTTL     time.Duration
 	speculativeEnabled bool
+	fullReportRepair   *fullReportRepair
 
 	blockSizeTokens int
 
@@ -173,6 +177,17 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 	if config.TokenProcessorConfig == nil {
 		config.TokenProcessorConfig = kvblock.DefaultTokenProcessorConfig()
 	}
+	var repair *fullReportRepair
+	if config.FullReportRepair != nil {
+		if err := validateFullReportRepairPrerequisites(config.KVEventsConfig); err != nil {
+			return nil, err
+		}
+		repairConfig, err := normalizeFullReportRepairConfig(*config.FullReportRepair)
+		if err != nil {
+			return nil, fmt.Errorf("invalid fullReportRepair: %w", err)
+		}
+		repair = newFullReportRepair(repairConfig)
+	}
 
 	podSelector := labels.Everything()
 	if config.KVEventsConfig != nil && config.KVEventsConfig.PodDiscoveryConfig != nil {
@@ -215,6 +230,9 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		return nil, fmt.Errorf("failed to create KV-events engine adapter: %w", err)
 	}
 	pool := kvevents.NewPool(config.KVEventsConfig, indexer.KVBlockIndex(), tokenProcessor, adapter)
+	if repair != nil {
+		pool.SetStreamObserver(repair.observe)
+	}
 	pool.Start(ctx)
 
 	subscribersManager := kvevents.NewSubscriberManager(pool)
@@ -243,6 +261,7 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		speculativeCache:   speculativeCache,
 		speculativeTTL:     speculativeTTL,
 		speculativeEnabled: config.SpeculativeIndexing,
+		fullReportRepair:   repair,
 		blockSizeTokens:    tokenProcessor.BlockSize(),
 		subscriberCtx:      ctx,
 	}, nil
@@ -413,6 +432,7 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 
 	maxMatch := 0
 	results := make([]endpointResult, 0, len(endpoints))
+	repairMatches := make(map[string]repairMatch, len(endpoints))
 	for _, ep := range endpoints {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -427,9 +447,11 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 			maxMatch = matchLen
 		}
 		cachedBlocks := 0
+		confirmedBlocks := 0
 		cachedBlocksByTier := map[string]int{}
 		for _, lu := range lookups {
 			cachedBlocks += matchedBlockCount(lu.keys, lu.keyToPods, addr)
+			confirmedBlocks += matchedConfirmedBlockCount(lu.keys, lu.keyToPods, addr)
 			for tier, count := range matchedBlockCountByTier(lu.keys, lu.keyToPods, addr) {
 				cachedBlocksByTier[tier] += count
 			}
@@ -441,14 +463,15 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 			info.WithMM(attrprefix.MMMatchInfo{MatchBlocks: countMMMatchedBlocks(mmBlockIndices, cachedBlocks)})
 		}
 		results = append(results, endpointResult{endpoint: ep, info: info})
+		repairMatches[addr] = repairMatch{total: totalBlocks, confirmed: confirmedBlocks}
 	}
 	if err := p.publishEndpointResults(ctx, results); err != nil {
 		return err
 	}
 
-	if p.speculativeEnabled {
+	if p.speculativeEnabled || p.fullReportRepair != nil {
 		p.pluginState.Write(request.RequestID, blockKeysStateKey,
-			&blockKeysState{perPromptKeys: perPromptKeys})
+			&blockKeysState{perPromptKeys: perPromptKeys, repairMatches: repairMatches})
 	}
 
 	span.SetAttributes(
@@ -471,9 +494,10 @@ func (p *Producer) produceFused(ctx context.Context, span trace.Span,
 	scoredIndex kvblock.ScoredLookupIndex, endpointSet sets.Set[string], logger logr.Logger,
 ) (handled bool, err error) {
 	type podAgg struct {
-		score  float64
-		blocks int
-		byTier map[string]int
+		score     float64
+		blocks    int
+		confirmed int
+		byTier    map[string]int
 	}
 	agg := make(map[string]*podAgg)
 	totalBlocks := 0
@@ -495,6 +519,7 @@ func (p *Producer) produceFused(ctx context.Context, span trace.Span,
 			}
 			a.score += s.WeightedScore
 			a.blocks += s.MatchedBlocks
+			a.confirmed += s.ConfirmedBlocks
 			for tier, count := range s.BlocksByTier {
 				a.byTier[tier] += count
 			}
@@ -504,6 +529,7 @@ func (p *Producer) produceFused(ctx context.Context, span trace.Span,
 
 	maxMatch := 0
 	results := make([]endpointResult, 0, len(endpoints))
+	repairMatches := make(map[string]repairMatch, len(endpoints))
 	for _, ep := range endpoints {
 		if err := ctx.Err(); err != nil {
 			return true, err
@@ -513,10 +539,10 @@ func (p *Producer) produceFused(ctx context.Context, span trace.Span,
 			continue
 		}
 		addr := fmt.Sprintf("%s:%s", md.Address, md.Port)
-		matchLen, cachedBlocks := 0, 0
+		matchLen, cachedBlocks, confirmedBlocks := 0, 0, 0
 		byTier := map[string]int{}
 		if a := agg[addr]; a != nil {
-			matchLen, cachedBlocks, byTier = int(a.score), a.blocks, a.byTier
+			matchLen, cachedBlocks, confirmedBlocks, byTier = int(a.score), a.blocks, a.confirmed, a.byTier
 		}
 		if matchLen > maxMatch {
 			maxMatch = matchLen
@@ -528,14 +554,15 @@ func (p *Producer) produceFused(ctx context.Context, span trace.Span,
 			info.WithMM(attrprefix.MMMatchInfo{MatchBlocks: countMMMatchedBlocks(mmBlockIndices, cachedBlocks)})
 		}
 		results = append(results, endpointResult{endpoint: ep, info: info})
+		repairMatches[addr] = repairMatch{total: totalBlocks, confirmed: confirmedBlocks}
 	}
 	if err := p.publishEndpointResults(ctx, results); err != nil {
 		return true, err
 	}
 
-	if p.speculativeEnabled {
+	if p.speculativeEnabled || p.fullReportRepair != nil {
 		p.pluginState.Write(request.RequestID, blockKeysStateKey,
-			&blockKeysState{perPromptKeys: perPromptKeys})
+			&blockKeysState{perPromptKeys: perPromptKeys, repairMatches: repairMatches})
 	}
 
 	span.SetAttributes(

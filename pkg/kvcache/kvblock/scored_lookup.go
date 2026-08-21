@@ -50,6 +50,9 @@ type PodMatchStats struct {
 	WeightedScore float64
 	// MatchedBlocks is the chain length in blocks, regardless of tier.
 	MatchedBlocks int
+	// ConfirmedBlocks is the contiguous chain length covered by at least one
+	// non-speculative entry at every block. It excludes speculative-only rows.
+	ConfirmedBlocks int
 	// BlocksByTier is the per-tier chain length: a tier counts a block only
 	// while the pod holds every previous block in that same tier.
 	// Speculative entries count under SpeculativeTier. Never nil.
@@ -174,6 +177,9 @@ type slotCursor struct {
 	weight float64
 	// tiers is the tier bitmask at the current key.
 	tiers uint64
+	// confirmed is true when at least one engine-reported entry is present at
+	// the current key. Speculative rows do not satisfy it.
+	confirmed bool
 }
 
 // slotChain is one candidate's accumulated chain state.
@@ -185,6 +191,10 @@ type slotChain struct {
 	score float64
 	// aliveTiers is the bitmask of tiers still contiguously held.
 	aliveTiers uint64
+	// confirmed is the contiguous non-speculative prefix length. Once a block
+	// is speculative-only the confirmed chain cannot resume.
+	confirmed      int
+	confirmedAlive bool
 }
 
 // maxTierMaskBits bounds the per-tier chain bitmasks. Lookups against an
@@ -241,6 +251,7 @@ retry:
 	}
 
 	filtered := podIdentifierSet.Len() > 0
+	speculativeTierIdx, hasSpeculativeTier := m.tiers.lookup(SpeculativeTier)
 
 	// Per-slot working state for the candidate pods, in slot order.
 	var (
@@ -298,11 +309,13 @@ retry:
 				c.seen = keyStamp
 				c.weight = w
 				c.tiers = tierBit
+				c.confirmed = !hasSpeculativeTier || rec.statTierIdx != speculativeTierIdx
 			} else {
 				if w > c.weight {
 					c.weight = w
 				}
 				c.tiers |= tierBit
+				c.confirmed = c.confirmed || !hasSpeculativeTier || rec.statTierIdx != speculativeTierIdx
 			}
 		}
 		pc.mu.Unlock()
@@ -317,6 +330,10 @@ retry:
 				chains[s].score = cur[s].weight
 				chains[s].matched = 1
 				chains[s].aliveTiers = cur[s].tiers
+				chains[s].confirmedAlive = cur[s].confirmed
+				if cur[s].confirmed {
+					chains[s].confirmed = 1
+				}
 				countAliveTiers(tierCounts, int32(s), chains[s].aliveTiers, nTiers)
 			}
 			continue
@@ -330,6 +347,13 @@ retry:
 			chains[s].score += cur[s].weight
 			chains[s].matched++
 			chains[s].aliveTiers &= cur[s].tiers
+			if chains[s].confirmedAlive {
+				if cur[s].confirmed {
+					chains[s].confirmed++
+				} else {
+					chains[s].confirmedAlive = false
+				}
+			}
 			countAliveTiers(tierCounts, s, chains[s].aliveTiers, nTiers)
 			keep = append(keep, s)
 		}
@@ -355,9 +379,10 @@ retry:
 				}
 			}
 			result[podNames[chains[s].podIdx]] = PodMatchStats{
-				WeightedScore: chains[s].score,
-				MatchedBlocks: chains[s].matched,
-				BlocksByTier:  byTier,
+				WeightedScore:   chains[s].score,
+				MatchedBlocks:   chains[s].matched,
+				ConfirmedBlocks: chains[s].confirmed,
+				BlocksByTier:    byTier,
 			}
 		}
 		return result, nil
