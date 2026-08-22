@@ -46,6 +46,23 @@ type InFlightLoad struct {
 	// Requests is the in-flight request count this endpoint has committed to,
 	// maintained with the same lifecycle as Tokens.
 	Requests int64
+
+	// ObservableRequests is the number of streaming in-flight requests for
+	// which response progress can be observed.
+	ObservableRequests int64
+
+	// AwaitingFirstResponse is the number of observable requests that have not
+	// produced their first response body chunk.
+	AwaitingFirstResponse int64
+
+	// ProgressTimestampSumUnixMilli is the sum of the most recent progress
+	// timestamp for every observable request. The assignment timestamp is used
+	// until the first response body chunk arrives.
+	ProgressTimestampSumUnixMilli int64
+
+	// OldestProgressUnixMilli is the oldest progress timestamp among observable
+	// requests. Zero means the endpoint has no observable requests.
+	OldestProgressUnixMilli int64
 }
 
 // Clone returns an independent copy of the InFlightLoad. The value-copy

@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -115,12 +116,14 @@ func InFlightLoadProducerFactory(name string, decoder *json.Decoder, handle fwkp
 		typedName:                fwkplugin.TypedName{Type: InFlightLoadProducerType, Name: name},
 		requestTracker:           newConcurrencyTracker(),
 		tokenTracker:             newConcurrencyTracker(),
+		requestProgressTracker:   newRequestProgressTracker(),
 		tokenEstimator:           NewSimpleTokenEstimatorWithConfig(outputRatio, cfg.MaxEstimatedOutputTokens),
 		addEstimatedOutputTokens: cfg.AddEstimatedOutputTokens,
 		dk:                       attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(name),
 		prefixMatchInfoDK:        attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(cfg.PrefixMatchInfoProducerName),
 		uncachedRequestTokensDk:  attrconcurrency.UncachedRequestTokensDataKey.WithNonEmptyProducerName(name),
 		syncCrossReplicaState:    syncCrossReplicaState,
+		now:                      time.Now,
 		PluginState:              fwkplugin.NewPluginState(ctx),
 	}, nil
 }
@@ -140,6 +143,7 @@ type InFlightLoadProducer struct {
 	typedName                fwkplugin.TypedName
 	requestTracker           *concurrencyTracker
 	tokenTracker             *concurrencyTracker
+	requestProgressTracker   *requestProgressTracker
 	tokenEstimator           TokenEstimator
 	addEstimatedOutputTokens bool
 	PluginState              *fwkplugin.PluginState
@@ -147,6 +151,7 @@ type InFlightLoadProducer struct {
 	prefixMatchInfoDK        fwkplugin.DataKey
 	uncachedRequestTokensDk  fwkplugin.DataKey
 	syncCrossReplicaState    bool
+	now                      func() time.Time
 	registeredEndpoints      sync.Map // key: string (NamespacedName), value: datalayer.Endpoint
 }
 
@@ -163,14 +168,17 @@ type addedTokensEntry struct {
 	// on the counter that received the increment. If the endpoint flaps (delete + recreate under the
 	// same NamespacedName) between increment and release, the captured instance is the orphaned
 	// counter; decrementing it leaves the live counter untouched.
-	tokenCounter   *atomic.Int64
-	requestCounter *atomic.Int64
-	requests       atomic.Int32
-	endpointName   string
-	namespace      string
-	producerName   string
-	fairnessID     string
-	priority       string
+	tokenCounter    *atomic.Int64
+	requestCounter  *atomic.Int64
+	requests        atomic.Int32
+	endpointName    string
+	namespace       string
+	producerName    string
+	fairnessID      string
+	priority        string
+	progressTracker *requestProgressTracker
+	progressKey     string
+	endpointID      string
 }
 
 var _ fwkplugin.EvictableStateData = (*addedTokensEntry)(nil)
@@ -184,13 +192,16 @@ func (e *addedTokensEntry) Clone() fwkplugin.StateData {
 		return nil
 	}
 	clone := &addedTokensEntry{
-		tokenCounter:   e.tokenCounter,
-		requestCounter: e.requestCounter,
-		endpointName:   e.endpointName,
-		namespace:      e.namespace,
-		producerName:   e.producerName,
-		fairnessID:     e.fairnessID,
-		priority:       e.priority,
+		tokenCounter:    e.tokenCounter,
+		requestCounter:  e.requestCounter,
+		endpointName:    e.endpointName,
+		namespace:       e.namespace,
+		producerName:    e.producerName,
+		fairnessID:      e.fairnessID,
+		priority:        e.priority,
+		progressTracker: e.progressTracker,
+		progressKey:     e.progressKey,
+		endpointID:      e.endpointID,
 	}
 	clone.tokens.Store(e.tokens.Load())
 	clone.requests.Store(e.requests.Load())
@@ -198,6 +209,9 @@ func (e *addedTokensEntry) Clone() fwkplugin.StateData {
 }
 
 func (e *addedTokensEntry) OnEvicted(_ string, _ fwkplugin.StateKey) {
+	if e.progressTracker != nil {
+		e.progressTracker.delete(e.endpointID, e.progressKey)
+	}
 	if t := e.tokens.Swap(0); t != 0 {
 		decrementClamped(e.tokenCounter, t)
 		inflightTokens.WithLabelValues(e.endpointName, e.namespace, e.producerName, e.fairnessID, e.priority).Sub(float64(t))
@@ -315,10 +329,7 @@ func (p *InFlightLoadProducer) CrossReplicaState() datalayer.CrossReplicaSpec {
 		SyncDisabled: !p.syncCrossReplicaState,
 		Supply: func(endpointID string) func() datalayer.Cloneable {
 			return func() datalayer.Cloneable {
-				return &attrconcurrency.InFlightLoad{
-					Requests: p.requestTracker.get(endpointID),
-					Tokens:   p.tokenTracker.get(endpointID),
-				}
+				return p.inFlightLoad(endpointID)
 			}
 		},
 		Aggregate: func(values []any) any {
@@ -327,6 +338,13 @@ func (p *InFlightLoadProducer) CrossReplicaState() datalayer.CrossReplicaSpec {
 				if ifl, ok := v.(*attrconcurrency.InFlightLoad); ok {
 					total.Requests += ifl.Requests
 					total.Tokens += ifl.Tokens
+					total.ObservableRequests += ifl.ObservableRequests
+					total.AwaitingFirstResponse += ifl.AwaitingFirstResponse
+					total.ProgressTimestampSumUnixMilli += ifl.ProgressTimestampSumUnixMilli
+					if total.OldestProgressUnixMilli == 0 ||
+						(ifl.OldestProgressUnixMilli != 0 && ifl.OldestProgressUnixMilli < total.OldestProgressUnixMilli) {
+						total.OldestProgressUnixMilli = ifl.OldestProgressUnixMilli
+					}
 				}
 			}
 			return total
@@ -359,10 +377,7 @@ func (p *InFlightLoadProducer) Extract(ctx context.Context, event datalayer.Endp
 		p.registeredEndpoints.Store(id, event.Endpoint)
 		event.Endpoint.GetAttributes().Put(p.dk, &datalayer.DynamicAttribute{
 			Get: func() datalayer.Cloneable {
-				return &attrconcurrency.InFlightLoad{
-					Tokens:   p.GetTokens(id),
-					Requests: p.GetRequests(id),
-				}
+				return p.inFlightLoad(id)
 			},
 		})
 		log.FromContext(ctx).V(logutil.DEFAULT).Info("Injected dynamic attribute into endpoint", "key", p.dk.String(), "endpoint", id)
@@ -441,13 +456,20 @@ func (p *InFlightLoadProducer) PreRequest(ctx context.Context, request *fwksched
 		inflightTokens.WithLabelValues(name, namespace, p.typedName.Name, fairnessID, priority).Add(float64(tokens))
 
 		entry := &addedTokensEntry{
-			tokenCounter:   tokenCounter,
-			requestCounter: requestCounter,
-			endpointName:   name,
-			namespace:      namespace,
-			producerName:   p.typedName.Name,
-			fairnessID:     fairnessID,
-			priority:       priority,
+			tokenCounter:    tokenCounter,
+			requestCounter:  requestCounter,
+			endpointName:    name,
+			namespace:       namespace,
+			producerName:    p.typedName.Name,
+			fairnessID:      fairnessID,
+			priority:        priority,
+			progressTracker: p.requestProgressTracker,
+			progressKey:     requestProgressKey(request.RequestID, profileName),
+			endpointID:      eid,
+		}
+		streaming := request.Body != nil && request.Body.Stream
+		if p.requestProgressTracker != nil {
+			p.requestProgressTracker.add(eid, entry.progressKey, streaming, p.currentTime().UnixMilli())
 		}
 		entry.tokens.Store(tokens)
 		entry.requests.Store(1)
@@ -499,6 +521,8 @@ func (p *InFlightLoadProducer) ResponseBody(
 	if result == nil {
 		return
 	}
+
+	p.markResponseProgress(request, result)
 
 	// When output tokens are excluded, the in-flight token estimate represents only
 	// the prompt cost, which is consumed by prefill. As soon as the first chunk
@@ -595,6 +619,38 @@ func addedTokensKey(endpointID, profileName string) string {
 	return endpointID + "|" + profileName + "|added"
 }
 
+func requestProgressKey(requestID, profileName string) string {
+	return requestID + "|" + profileName
+}
+
+func (p *InFlightLoadProducer) markResponseProgress(request *fwksched.InferenceRequest, result *fwksched.SchedulingResult) {
+	if p.requestProgressTracker == nil || request.Body == nil || !request.Body.Stream {
+		return
+	}
+	nowUnixMilli := p.currentTime().UnixMilli()
+	for profileName, profileResult := range result.ProfileResults {
+		if profileResult == nil || len(profileResult.TargetEndpoints) == 0 {
+			continue
+		}
+		endpoint := profileResult.TargetEndpoints[0]
+		if endpoint == nil || endpoint.GetMetadata() == nil {
+			continue
+		}
+		p.requestProgressTracker.markProgress(
+			endpoint.GetMetadata().ID.String(),
+			requestProgressKey(request.RequestID, profileName),
+			nowUnixMilli,
+		)
+	}
+}
+
+func (p *InFlightLoadProducer) currentTime() time.Time {
+	if p.now == nil {
+		return time.Now()
+	}
+	return p.now()
+}
+
 // uncachedInputTokens returns the prompt tokens this endpoint must actually compute,
 // excluding any prefix already cached on it.
 //
@@ -675,6 +731,7 @@ func (p *InFlightLoadProducer) Consumes() fwkplugin.DataDependencies {
 func (p *InFlightLoadProducer) DeleteEndpoint(endpointID string) {
 	p.requestTracker.delete(endpointID)
 	p.tokenTracker.delete(endpointID)
+	p.requestProgressTracker.deleteEndpoint(endpointID)
 }
 
 func (p *InFlightLoadProducer) GetTokens(eid string) int64 {
@@ -683,6 +740,18 @@ func (p *InFlightLoadProducer) GetTokens(eid string) int64 {
 
 func (p *InFlightLoadProducer) GetRequests(eid string) int64 {
 	return p.requestTracker.get(eid)
+}
+
+func (p *InFlightLoadProducer) inFlightLoad(endpointID string) *attrconcurrency.InFlightLoad {
+	progress := p.requestProgressTracker.snapshot(endpointID)
+	return &attrconcurrency.InFlightLoad{
+		Tokens:                        p.GetTokens(endpointID),
+		Requests:                      p.GetRequests(endpointID),
+		ObservableRequests:            progress.observableRequests,
+		AwaitingFirstResponse:         progress.awaitingFirstResponse,
+		ProgressTimestampSumUnixMilli: progress.progressTimestampSumUnixMilli,
+		OldestProgressUnixMilli:       progress.oldestProgressUnixMilli,
+	}
 }
 
 // concurrencyTracker manages thread-safe counters for inflight requests.

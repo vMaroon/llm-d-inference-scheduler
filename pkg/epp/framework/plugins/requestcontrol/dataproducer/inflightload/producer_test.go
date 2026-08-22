@@ -196,6 +196,160 @@ func TestInFlightLoadProducer_Lifecycle(t *testing.T) {
 	require.Equal(t, int64(0), producer.tokenTracker.get(endpointID))
 }
 
+func TestInFlightLoadProducer_TracksStreamingResponseProgress(t *testing.T) {
+	t.Parallel()
+
+	producer := newTestProducer(t)
+	nowUnixMilli := int64(1_000)
+	producer.now = func() time.Time {
+		now := time.UnixMilli(nowUnixMilli)
+		nowUnixMilli += 250
+		return now
+	}
+
+	endpointName := "streaming-progress-endpoint"
+	endpointID := fullEndpointName(endpointName)
+	endpoint := newStubSchedulingEndpoint(endpointName)
+	require.NoError(t, producer.Extract(context.Background(), datalayer.EndpointEvent{
+		Type:     datalayer.EventAddOrUpdate,
+		Endpoint: endpoint,
+	}))
+
+	req := makeTokenRequest("streaming-progress", 4)
+	req.Body.Stream = true
+	result := &fwksched.SchedulingResult{
+		PrimaryProfileName: "decode",
+		ProfileResults: map[string]*fwksched.ProfileRunResult{
+			"decode": {TargetEndpoints: []fwksched.Endpoint{endpoint}},
+		},
+	}
+	require.NoError(t, producer.PreRequest(context.Background(), req, result))
+
+	load := loadFromEndpoint(t, endpoint, producer.dk)
+	require.Equal(t, int64(1), load.Requests)
+	require.Equal(t, int64(1), load.ObservableRequests)
+	require.Equal(t, int64(1), load.AwaitingFirstResponse)
+	require.Equal(t, int64(1_000), load.ProgressTimestampSumUnixMilli)
+	require.Equal(t, int64(1_000), load.OldestProgressUnixMilli)
+
+	req.SchedulingResult = result
+	producer.ResponseBody(context.Background(), req, &requestcontrol.Response{StartOfStream: true}, nil)
+
+	load = loadFromEndpoint(t, endpoint, producer.dk)
+	require.Equal(t, int64(1), load.Requests)
+	require.Equal(t, int64(1), load.ObservableRequests)
+	require.Equal(t, int64(0), load.AwaitingFirstResponse)
+	require.Equal(t, int64(1_250), load.ProgressTimestampSumUnixMilli)
+	require.Equal(t, int64(1_250), load.OldestProgressUnixMilli)
+
+	producer.ResponseBody(context.Background(), req, &requestcontrol.Response{EndOfStream: true}, nil)
+
+	load = loadFromEndpoint(t, endpoint, producer.dk)
+	require.Equal(t, int64(0), load.Requests)
+	require.Equal(t, int64(0), load.ObservableRequests)
+	require.Equal(t, int64(0), load.AwaitingFirstResponse)
+	require.Equal(t, int64(0), load.ProgressTimestampSumUnixMilli)
+	require.Equal(t, int64(0), load.OldestProgressUnixMilli)
+	require.Equal(t, int64(0), producer.requestProgressTracker.count(endpointID))
+}
+
+func TestInFlightLoadProducer_DoesNotInferNonStreamingProgress(t *testing.T) {
+	t.Parallel()
+
+	producer := newTestProducer(t)
+	producer.now = func() time.Time { return time.UnixMilli(1_000) }
+	endpoint := newStubSchedulingEndpoint("non-streaming-progress-endpoint")
+	require.NoError(t, producer.Extract(context.Background(), datalayer.EndpointEvent{
+		Type:     datalayer.EventAddOrUpdate,
+		Endpoint: endpoint,
+	}))
+
+	req := makeTokenRequest("non-streaming-progress", 4)
+	result := &fwksched.SchedulingResult{
+		PrimaryProfileName: "decode",
+		ProfileResults: map[string]*fwksched.ProfileRunResult{
+			"decode": {TargetEndpoints: []fwksched.Endpoint{endpoint}},
+		},
+	}
+	require.NoError(t, producer.PreRequest(context.Background(), req, result))
+
+	load := loadFromEndpoint(t, endpoint, producer.dk)
+	require.Equal(t, int64(1), load.Requests)
+	require.Equal(t, int64(0), load.ObservableRequests)
+	require.Equal(t, int64(0), load.AwaitingFirstResponse)
+	require.Equal(t, int64(0), load.ProgressTimestampSumUnixMilli)
+	require.Equal(t, int64(0), load.OldestProgressUnixMilli)
+}
+
+func TestInFlightLoadProducer_ReleasesPrefillProgressAtFirstResponse(t *testing.T) {
+	t.Parallel()
+
+	producer := newTestProducer(t)
+	producer.now = func() time.Time { return time.UnixMilli(1_000) }
+	prefill := newStubSchedulingEndpoint("progress-prefill")
+	decode := newStubSchedulingEndpoint("progress-decode")
+	for _, endpoint := range []*stubSchedulingEndpoint{prefill, decode} {
+		require.NoError(t, producer.Extract(context.Background(), datalayer.EndpointEvent{
+			Type:     datalayer.EventAddOrUpdate,
+			Endpoint: endpoint,
+		}))
+	}
+
+	req := makeTokenRequest("prefill-progress-release", 4)
+	req.Body.Stream = true
+	result := &fwksched.SchedulingResult{
+		PrimaryProfileName: "prefill",
+		ProfileResults: map[string]*fwksched.ProfileRunResult{
+			"prefill": {TargetEndpoints: []fwksched.Endpoint{prefill}},
+			"decode":  {TargetEndpoints: []fwksched.Endpoint{decode}},
+		},
+	}
+	require.NoError(t, producer.PreRequest(context.Background(), req, result))
+	require.Equal(t, int64(1), loadFromEndpoint(t, prefill, producer.dk).ObservableRequests)
+	require.Equal(t, int64(1), loadFromEndpoint(t, decode, producer.dk).ObservableRequests)
+
+	req.SchedulingResult = result
+	producer.ResponseBody(context.Background(), req, &requestcontrol.Response{StartOfStream: true}, nil)
+
+	require.Equal(t, int64(0), loadFromEndpoint(t, prefill, producer.dk).ObservableRequests)
+	decodeLoad := loadFromEndpoint(t, decode, producer.dk)
+	require.Equal(t, int64(1), decodeLoad.ObservableRequests)
+	require.Equal(t, int64(0), decodeLoad.AwaitingFirstResponse)
+}
+
+func TestInFlightLoadProducer_CrossReplicaProgressAggregation(t *testing.T) {
+	t.Parallel()
+
+	producer := newTestProducer(t)
+	aggregate := producer.CrossReplicaState().Aggregate([]any{
+		&attrconcurrency.InFlightLoad{
+			Requests:                      2,
+			Tokens:                        20,
+			ObservableRequests:            2,
+			AwaitingFirstResponse:         1,
+			ProgressTimestampSumUnixMilli: 2_500,
+			OldestProgressUnixMilli:       1_000,
+		},
+		&attrconcurrency.InFlightLoad{
+			Requests:                      3,
+			Tokens:                        30,
+			ObservableRequests:            1,
+			AwaitingFirstResponse:         0,
+			ProgressTimestampSumUnixMilli: 1_750,
+			OldestProgressUnixMilli:       1_750,
+		},
+	}).(*attrconcurrency.InFlightLoad)
+
+	require.Equal(t, &attrconcurrency.InFlightLoad{
+		Requests:                      5,
+		Tokens:                        50,
+		ObservableRequests:            3,
+		AwaitingFirstResponse:         1,
+		ProgressTimestampSumUnixMilli: 4_250,
+		OldestProgressUnixMilli:       1_000,
+	}, aggregate)
+}
+
 func TestInFlightLoadProducer_MultiPodLifecycle(t *testing.T) {
 	t.Parallel()
 
@@ -594,6 +748,16 @@ func makeTokenRequest(requestID string, inputTokens int) *fwksched.InferenceRequ
 			},
 		},
 	}
+}
+
+func loadFromEndpoint(t *testing.T, endpoint fwksched.Endpoint, key fwkplugin.DataKey) *attrconcurrency.InFlightLoad {
+	t.Helper()
+	value, ok := endpoint.Get(key)
+	require.True(t, ok)
+	load, ok := value.(*attrconcurrency.InFlightLoad)
+	require.True(t, ok)
+	require.NotNil(t, load)
+	return load
 }
 
 // TestInFlightLoadProducer_ExcludeOutputTokens_StartOfStreamRelease verifies that when

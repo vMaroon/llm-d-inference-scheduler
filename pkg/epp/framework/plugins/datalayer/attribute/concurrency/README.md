@@ -10,6 +10,10 @@ Captures the current real-time load of an endpoint as tracked by the EPP.
 - **Fields**:
   - `Tokens`: Number of tokens currently in-flight.
   - `Requests`: Number of requests currently in-flight.
+  - `ObservableRequests`: Streaming requests with observable response progress.
+  - `AwaitingFirstResponse`: Observable requests without a response body chunk.
+  - `ProgressTimestampSumUnixMilli`: Sum of the latest progress timestamps.
+  - `OldestProgressUnixMilli`: Oldest latest-progress timestamp.
 
 ## Producers
 

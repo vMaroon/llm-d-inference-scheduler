@@ -5,6 +5,7 @@
 Tracks real-time in-flight request and token counts per endpoint by hooking into the request lifecycle. Writes an `InFlightLoad` attribute onto each endpoint in the `Produce` phase, consumed by the following plugins:
 - `token-load-scorer`: Scores endpoints based on in-flight tokens.
 - `active-request-scorer`: Scores endpoints based on in-flight requests.
+- `decode-progress-scorer`: Orders equal-count decode endpoints using observed response progress.
 - `concurrency-detector`: Provides admission control based on in-flight requests/tokens.
 - `prefix-cache-affinity-filter`: Uses in-flight tokens as a load gate to break stickiness.
 
@@ -15,6 +16,7 @@ Tracks real-time in-flight request and token counts per endpoint by hooking into
     - If `addEstimatedOutputTokens` is `false` (default): For streaming requests, all tokens are released as soon as the first chunk of the response is received (`StartOfStream`), as the prefill compute is complete. For non-streaming requests (or as a safety net), tokens are released when the response completes (`EndOfStream`).
     - If `addEstimatedOutputTokens` is `true`: The prompt portion is released at `StartOfStream` (for streaming) or `EndOfStream`, and the estimated output portion is released only when the response completes (`EndOfStream`).
 - **Request Release**: In-flight request counters are always released when the response completes (`EndOfStream`).
+- **Response Progress**: Streaming requests carry assignment and latest-response timestamps in `InFlightLoad`. Non-streaming requests are counted as active without inferred progress.
 
 The producer hooks three lifecycle phases:
 - **Produce**: Writes current in-flight counts to each endpoint's attributes.
@@ -43,6 +45,7 @@ low-output workloads, where a fixed ratio would otherwise overstate output.
 ## Related Documentation
 - [Token Load Scorer](../../../scheduling/scorer/tokenload/README.md)
 - [Active Request Scorer](../../../scheduling/scorer/activerequest/README.md)
+- [Decode Progress Scorer](../../../scheduling/scorer/decodeprogress/README.md)
 - [Concurrency Detector](../../../flowcontrol/saturationdetector/concurrency/README.md)
 - [Prefix Cache Affinity Filter](../../../scheduling/filter/prefixcacheaffinity/README.md)
 - [Concurrency Attributes](../../../datalayer/attribute/concurrency/README.md)
