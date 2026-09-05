@@ -101,6 +101,9 @@ func (z *zmqSubscriber) Start(ctx context.Context) {
 			// We run the subscriber in a separate function to handle socket
 			// setup/teardown and connection retries cleanly.
 			z.runSubscriber(ctx)
+			if z.pool.consumer != nil && z.sourceEndpoint != "" {
+				z.pool.resetForSource("", z.sourceEndpoint)
+			}
 			// wait before retrying, unless the context has been canceled.
 			select {
 			case <-time.After(retryInterval):
@@ -176,7 +179,9 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 		}
 
 		if z.replayEndpoint == "" {
-			z.addTask(ctx, topic, seq, payload)
+			if z.acceptLiveWithoutReplay(topic, seq) {
+				z.addTask(ctx, topic, seq, payload)
+			}
 			continue
 		}
 
@@ -243,6 +248,22 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 		z.lastSeq = seq
 		z.hasLastSeq = true
 	}
+}
+
+func (z *zmqSubscriber) acceptLiveWithoutReplay(topic string, seq uint64) bool {
+	if z.pool.consumer == nil {
+		return true
+	}
+	if z.hasLastLiveSeq {
+		if seq == z.lastLiveSeq {
+			return false
+		}
+		if seq != z.lastLiveSeq+1 {
+			z.pool.resetForSource(topic, z.sourceEndpoint)
+		}
+	}
+	z.lastLiveSeq, z.hasLastLiveSeq = seq, true
+	return true
 }
 
 // addTask hands a received message to the pool, carrying the receive span's
