@@ -98,10 +98,7 @@ type Producer struct {
 
 	subscribersManager subscriberManager
 	kvEventsConfig     *kvevents.Config
-	// podSelector is the parsed KVEventsConfig.PodDiscoveryConfig.PodLabelSelector.
-	// Endpoint notifications whose labels do not match are not subscribed to;
-	// nil matches every endpoint.
-	podSelector labels.Selector
+	podSelector        labels.Selector // nil matches every endpoint.
 
 	kvBlockScorer kvcache.KVBlockScorer
 

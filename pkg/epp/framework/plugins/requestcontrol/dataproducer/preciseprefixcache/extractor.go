@@ -29,12 +29,9 @@ import (
 
 var _ fwkdl.EndpointExtractor = &Producer{}
 
-// Extract processes endpoint lifecycle events emitted by the
-// endpoint-notification-source: add/update installs a per-pod ZMQ KV-events
-// subscriber, delete tears one down. No-op unless per-pod discovery is
-// enabled, and endpoints outside PodDiscoveryConfig.PodLabelSelector are
-// ignored so that pool members that publish no KV events (e.g. decode-only
-// pods) are never dialed.
+// Extract subscribes matching endpoints to per-pod KV events when discovery is
+// enabled. Deleted endpoints and endpoints that stop matching lose their
+// subscriber and cached index entries.
 func (p *Producer) Extract(ctx context.Context, event fwkdl.EndpointEvent) error {
 	if !p.kvEventsConfig.DiscoverPods || p.kvEventsConfig.PodDiscoveryConfig == nil {
 		return nil
@@ -47,19 +44,14 @@ func (p *Producer) Extract(ctx context.Context, event fwkdl.EndpointEvent) error
 	logger := log.FromContext(ctx).WithName(p.typedName.String())
 	endpointKey := meta.ID.String()
 
-	if p.podSelector != nil && !p.podSelector.Matches(labels.Set(meta.Labels)) {
-		logger.V(logging.TRACE).Info("Skipping endpoint outside podLabelSelector",
-			"endpoint", endpointKey, "selector", p.podSelector.String())
-		return nil
-	}
-
-	switch event.Type {
-	case fwkdl.EventAddOrUpdate:
+	matchesSelector := p.podSelector == nil || p.podSelector.Matches(labels.Set(meta.Labels))
+	switch {
+	case event.Type == fwkdl.EventAddOrUpdate && matchesSelector:
 		if err := p.ensureSubscriber(ctx, meta); err != nil {
 			return err
 		}
 		logger.V(logging.DEBUG).Info("Adding subscriber", "endpoint", endpointKey)
-	case fwkdl.EventDelete:
+	case event.Type == fwkdl.EventAddOrUpdate || event.Type == fwkdl.EventDelete:
 		p.subscribersManager.RemoveSubscriber(ctx, endpointKey)
 		if meta.Address != "" {
 			if err := p.kvCacheIndexer.KVBlockIndex().Clear(ctx, fmt.Sprintf("%s:%s", meta.Address, meta.Port)); err != nil {
