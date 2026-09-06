@@ -113,6 +113,7 @@ func InFlightLoadProducerFactory(name string, decoder *json.Decoder, handle fwkp
 		addEstimatedOutputTokens: cfg.AddEstimatedOutputTokens,
 		dk:                       attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(name),
 		prefixMatchInfoDK:        attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(cfg.PrefixMatchInfoProducerName),
+		requirePrefixMatchInfo:   cfg.PrefixMatchInfoProducerName != "",
 		uncachedRequestTokensDk:  attrconcurrency.UncachedRequestTokensDataKey.WithNonEmptyProducerName(name),
 		syncCrossReplicaState:    syncCrossReplicaState,
 		PluginState:              fwkplugin.NewPluginState(ctx),
@@ -139,6 +140,7 @@ type InFlightLoadProducer struct {
 	PluginState              *fwkplugin.PluginState
 	dk                       fwkplugin.DataKey
 	prefixMatchInfoDK        fwkplugin.DataKey
+	requirePrefixMatchInfo   bool
 	uncachedRequestTokensDk  fwkplugin.DataKey
 	syncCrossReplicaState    bool
 	registeredEndpoints      sync.Map // key: string (NamespacedName), value: datalayer.Endpoint
@@ -703,11 +705,11 @@ func (p *InFlightLoadProducer) Produces() map[fwkplugin.DataKey]any {
 // Consumes declares TokenizedRequest as required so the data-layer DAG orders a
 // token-producer ahead of this producer and auto-creates one when none is
 // configured; without it the input-token estimate silently reads zero.
-// PrefixCacheMatchInfo is optional -- used to discount the already-cached prompt
-// prefix from the prefix producer selected by prefixMatchInfoProducerName
-// (approximate by default, or a precise-prefix-cache producer).
+// An explicitly configured prefix producer is required so its cache match is
+// available before UncachedRequestTokens is calculated. Without an explicit
+// producer, the default prefix match remains optional for load-only configs.
 func (p *InFlightLoadProducer) Consumes() fwkplugin.DataDependencies {
-	return fwkplugin.DataDependencies{
+	deps := fwkplugin.DataDependencies{
 		Required: map[fwkplugin.DataKey]any{
 			tokenproducer.TokenizedPromptDataKey: fwksched.TokenizedRequest{},
 		},
@@ -715,6 +717,11 @@ func (p *InFlightLoadProducer) Consumes() fwkplugin.DataDependencies {
 			p.prefixMatchInfoDK: attrprefix.PrefixCacheMatchInfo{},
 		},
 	}
+	if p.requirePrefixMatchInfo {
+		deps.Required[p.prefixMatchInfoDK] = attrprefix.PrefixCacheMatchInfo{}
+		delete(deps.Optional, p.prefixMatchInfoDK)
+	}
+	return deps
 }
 
 // DeleteEndpoint removes an endpoint from the concurrency trackers to prevent memory leaks.
