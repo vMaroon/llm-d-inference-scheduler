@@ -77,7 +77,7 @@ func TestInFlightLoadProducer_Consumes(t *testing.T) {
 }
 
 // prefixMatchInfoProducerName selects which prefix producer (approximate or
-// precise) feeds the cached-prefix discount, by both the required dependency key
+// precise) feeds the cached-prefix discount, by both the optional dependency key
 // and the runtime read.
 func TestInFlightLoadProducer_PrefixMatchInfoProducerName(t *testing.T) {
 	t.Parallel()
@@ -94,10 +94,9 @@ func TestInFlightLoadProducer_PrefixMatchInfoProducerName(t *testing.T) {
 
 	preciseKey := attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(preciseName)
 
-	// An explicitly selected producer must run before this producer computes
-	// UncachedRequestTokens. Optional dependencies do not establish DAG ordering.
-	require.Contains(t, producer.Consumes().Required, preciseKey)
-	require.NotContains(t, producer.Consumes().Optional, preciseKey)
+	// The dependency remains optional even when a producer is explicitly selected.
+	require.Contains(t, producer.Consumes().Optional, preciseKey)
+	require.NotContains(t, producer.Consumes().Required, preciseKey)
 	require.NotContains(t, producer.Consumes().Optional, attrprefix.PrefixCacheMatchInfoDataKey)
 
 	// The discount reads PrefixCacheMatchInfo from the configured producer's key
